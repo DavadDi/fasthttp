@@ -28,6 +28,35 @@ func TestDecodeArgAppend(t *testing.T) {
 		"f.o,1:2/4=~`!@#$%^&*()_-=+\\|/[]{};:'\"<>,./?")
 }
 
+func TestDecodeArgAppendNoPlus(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"%", "%"},
+		{"%a", "%a"},
+		{"%zz", "%zz"},
+		{"%20", " "},
+		{"%2B+", "++"},
+		{"x%20y%", "x y%"},
+	}
+	for _, testCase := range testCases {
+		got := decodeArgAppendNoPlus(nil, []byte(testCase.input))
+		if string(got) != testCase.want {
+			t.Fatalf("unexpected decodeArgAppendNoPlus(%q)=%q; expecting %q", testCase.input, got, testCase.want)
+		}
+
+		inPlace := []byte(testCase.input)
+		got = decodeArgAppendNoPlus(inPlace[:0], inPlace)
+		if string(got) != testCase.want {
+			t.Fatalf("unexpected in-place decodeArgAppendNoPlus(%q)=%q; expecting %q", testCase.input, got, testCase.want)
+		}
+	}
+}
+
 func testDecodeArgAppend(t *testing.T, s, expectedResult string) {
 	result := decodeArgAppend(nil, []byte(s))
 	if string(result) != expectedResult {
@@ -68,7 +97,7 @@ func TestArgsAdd(t *testing.T) {
 	}
 
 	var barFound, bazFound, oneFound, emptyFound1, emptyFound2, baFound bool
-	a1.VisitAll(func(k, v []byte) {
+	for k, v := range a1.All() {
 		switch string(k) {
 		case "foo":
 			switch string(v) {
@@ -95,9 +124,25 @@ func TestArgsAdd(t *testing.T) {
 		default:
 			t.Fatalf("unexpected key found %q", k)
 		}
-	})
+	}
 	if !barFound || !bazFound || !oneFound || !emptyFound1 || !emptyFound2 || !baFound {
 		t.Fatalf("something is missing: %v, %v, %v, %v, %v, %v", barFound, bazFound, oneFound, emptyFound1, emptyFound2, baFound)
+	}
+}
+
+func TestArgsSortKeys(t *testing.T) {
+	t.Parallel()
+
+	var a Args
+	a.Add("a", "789")
+	a.Add("b", "456")
+	a.Add("a", "123")
+	a.SortKeys(bytes.Compare)
+
+	s := a.String()
+	expectedS := "a=789&a=123&b=456"
+	if s != expectedS {
+		t.Fatalf("unexpected result: %q. Expecting %q", s, expectedS)
 	}
 }
 
@@ -107,16 +152,16 @@ func TestArgsAcquireReleaseSequential(t *testing.T) {
 
 func TestArgsAcquireReleaseConcurrent(t *testing.T) {
 	ch := make(chan struct{}, 10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		go func() {
 			testArgsAcquireRelease(t)
 			ch <- struct{}{}
 		}()
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case <-ch:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatalf("timeout")
 		}
 	}
@@ -125,7 +170,7 @@ func TestArgsAcquireReleaseConcurrent(t *testing.T) {
 func testArgsAcquireRelease(t *testing.T) {
 	a := AcquireArgs()
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := fmt.Sprintf("key_%d", i)
 		v := fmt.Sprintf("value_%d", i*3+123)
 		a.Set(k, v)
@@ -135,7 +180,7 @@ func testArgsAcquireRelease(t *testing.T) {
 	a.Reset()
 	a.Parse(s)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := fmt.Sprintf("key_%d", i)
 		expectedV := fmt.Sprintf("value_%d", i*3+123)
 		v := a.Peek(k)
@@ -182,8 +227,8 @@ func TestArgsEscape(t *testing.T) {
 
 	// Test all characters
 	k := "f.o,1:2/4"
-	var v = make([]byte, 256)
-	for i := 0; i < 256; i++ {
+	v := make([]byte, 256)
+	for i := range 256 {
 		v[i] = byte(i)
 	}
 	u := url.Values{}
@@ -210,8 +255,8 @@ func TestPathEscape(t *testing.T) {
 	testPathEscape(t, "*") // See https://github.com/golang/go/issues/11202
 
 	// Test all characters
-	var pathSegment = make([]byte, 256)
-	for i := 0; i < 256; i++ {
+	pathSegment := make([]byte, 256)
+	for i := range 256 {
 		pathSegment[i] = byte(i)
 	}
 	testPathEscape(t, "/foo/"+string(pathSegment))
@@ -237,7 +282,7 @@ func TestArgsWriteTo(t *testing.T) {
 	var w bytebufferpool.ByteBuffer
 	n, err := a.WriteTo(&w)
 	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if n != int64(len(s)) {
 		t.Fatalf("unexpected n: %d. Expecting %d", n, len(s))
@@ -329,23 +374,23 @@ func TestArgsCopyTo(t *testing.T) {
 
 func testCopyTo(t *testing.T, a *Args) {
 	keys := make(map[string]struct{})
-	a.VisitAll(func(k, v []byte) {
+	for k := range a.All() {
 		keys[string(k)] = struct{}{}
-	})
+	}
 
 	var b Args
 	a.CopyTo(&b)
 
-	if !reflect.DeepEqual(*a, b) { //nolint
-		t.Fatalf("ArgsCopyTo fail, a: \n%+v\nb: \n%+v\n", *a, b) //nolint
+	if !reflect.DeepEqual(a, &b) {
+		t.Fatalf("ArgsCopyTo fail, a: \n%+v\nb: \n%+v\n", a, &b)
 	}
 
-	b.VisitAll(func(k, v []byte) {
+	for k := range b.All() {
 		if _, ok := keys[string(k)]; !ok {
 			t.Fatalf("unexpected key %q after copying from %q", k, a.String())
 		}
 		delete(keys, string(k))
-	})
+	}
 	if len(keys) > 0 {
 		t.Fatalf("missing keys %#v after copying from %q", keys, a.String())
 	}
@@ -387,7 +432,7 @@ func TestArgsStringCompose(t *testing.T) {
 	expectedS := "foo=bar&aa=bbb&%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82=%D0%BC%D0%B8%D1%80&bb&=xxxx&cvx=&novalue"
 	s := a.String()
 	if s != expectedS {
-		t.Fatalf("Unexpected string %q. Exected %q", s, expectedS)
+		t.Fatalf("Unexpected string %q. Expected %q", s, expectedS)
 	}
 }
 
@@ -426,8 +471,8 @@ func TestArgsSetGetDel(t *testing.T) {
 	}
 	a.Del("xxx")
 
-	for j := 0; j < 3; j++ {
-		for i := 0; i < 10; i++ {
+	for range 3 {
+		for i := range 10 {
 			k := fmt.Sprintf("foo%d", i)
 			v := fmt.Sprintf("bar_%d", i)
 			a.Set(k, v)
@@ -436,20 +481,20 @@ func TestArgsSetGetDel(t *testing.T) {
 			}
 		}
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := fmt.Sprintf("foo%d", i)
 		v := fmt.Sprintf("bar_%d", i)
 		if string(a.Peek(k)) != v {
 			t.Fatalf("Unexpected value: %q. Expected %q", a.Peek(k), v)
 		}
 		a.Del(k)
-		if string(a.Peek(k)) != "" {
+		if len(a.Peek(k)) != 0 {
 			t.Fatalf("Unexpected value: %q. Expected %q", a.Peek(k), "")
 		}
 	}
 
 	a.Parse("aaa=xxx&bb=aa")
-	if string(a.Peek("foo0")) != "" {
+	if len(a.Peek("foo0")) != 0 {
 		t.Fatalf("Unexpected value %q", a.Peek("foo0"))
 	}
 	if string(a.Peek("aaa")) != "xxx" {
@@ -459,7 +504,7 @@ func TestArgsSetGetDel(t *testing.T) {
 		t.Fatalf("Unexpected value %q. Expected %q", a.Peek("bb"), "aa")
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := fmt.Sprintf("xx%d", i)
 		v := fmt.Sprintf("yy%d", i)
 		a.Set(k, v)
@@ -474,7 +519,7 @@ func TestArgsSetGetDel(t *testing.T) {
 			t.Fatalf("Unexpected value: %q. Expected %q", a.Peek(k), v)
 		}
 		a.Del(k)
-		if string(a.Peek(k)) != "" {
+		if len(a.Peek(k)) != 0 {
 			t.Fatalf("Unexpected value: %q. Expected %q", a.Peek(k), "")
 		}
 	}
@@ -524,8 +569,54 @@ func TestArgsParse(t *testing.T) {
 	// invalid percent encoding
 	testArgsParse(t, &a, "f%=x&qw%z=d%0k%20p&%%20=%%%20x", 3, "f%=x", "qw%z=d%0k p", "% =%% x")
 
+	// escapes in only the key or only the value, next to the separators
+	testArgsParse(t, &a, "a+b=c&d=e%2Bf&+=%26&g%2=h+", 4, "a b=c", "d=e+f", " =&", "g%2=h ")
+	testArgsParse(t, &a, "x%41&y+", 2, "xA=", "y =")
+
 	// special chars
 	testArgsParse(t, &a, "a.b,c:d/e=f.g,h:i/q", 1, "a.b,c:d/e=f.g,h:i/q")
+}
+
+// The scanner notes the first escape of each key and value while splitting
+// them; splitting first and decoding each part on its own must agree.
+func TestArgsParseMatchesSplitDecode(t *testing.T) {
+	t.Parallel()
+
+	var a Args
+	var src []byte
+	var walk func(n int)
+	walk = func(n int) {
+		a.ParseBytes(src)
+		i := 0
+		for kv := range bytes.SplitSeq(src, []byte{'&'}) {
+			k, v, hasValue := bytes.Cut(kv, []byte{'='})
+			key, value := decodeArgAppend(nil, k), decodeArgAppend(nil, v)
+			if len(key) == 0 && len(value) == 0 {
+				continue
+			}
+			if i == len(a.args) {
+				t.Fatalf("ParseBytes(%q): missing arg %q=%q", src, key, value)
+			}
+			got := &a.args[i]
+			if !bytes.Equal(got.key, key) || !bytes.Equal(got.value, value) || got.noValue == hasValue {
+				t.Fatalf("ParseBytes(%q): arg %d is %q=%q (noValue %v), want %q=%q (noValue %v)",
+					src, i, got.key, got.value, got.noValue, key, value, !hasValue)
+			}
+			i++
+		}
+		if i != len(a.args) {
+			t.Fatalf("ParseBytes(%q): got %d args, want %d", src, len(a.args), i)
+		}
+		if n == 0 {
+			return
+		}
+		for _, c := range []byte("a=&%+2F") {
+			src = append(src, c)
+			walk(n - 1)
+			src = src[:len(src)-1]
+		}
+	}
+	walk(6)
 }
 
 func TestArgsHas(t *testing.T) {
@@ -594,7 +685,7 @@ func TestArgsDeleteAll(t *testing.T) {
 	a.Add("q2", "1234")
 	a.Del("q1")
 	if a.Len() != 1 || a.Has("q1") {
-		t.Fatalf("Expected q1 arg to be completely deleted. Current Args: %s", a.String())
+		t.Fatalf("Expected q1 arg to be completely deleted. Current Args: %q", a.String())
 	}
 }
 

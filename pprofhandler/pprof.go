@@ -1,9 +1,10 @@
+// Package pprofhandler provides a fasthttp handler similar to net/http/pprof.
 package pprofhandler
 
 import (
+	"bytes"
 	"net/http/pprof"
 	rtp "runtime/pprof"
-	"strings"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
@@ -17,23 +18,54 @@ var (
 	index   = fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Index)
 )
 
+var (
+	cmdlinePath = []byte("/debug/pprof/cmdline")
+	profilePath = []byte("/debug/pprof/profile")
+	symbolPath  = []byte("/debug/pprof/symbol")
+	tracePath   = []byte("/debug/pprof/trace")
+	indexPath   = []byte("/debug/pprof/")
+)
+
+// matchPprofPath checks whether path exactly matches a pprof endpoint.
+// It only accepts the exact path (e.g. /debug/pprof/heap) and rejects
+// paths with a trailing slash, matching the behaviour of net/http/pprof
+// which returns 404 for paths ending in /.
+func matchPprofPath(path, endpoint []byte) bool {
+	return bytes.Equal(path, endpoint)
+}
+
 // PprofHandler serves server runtime profiling data in the format expected by the pprof visualization tool.
 //
-// See https://golang.org/pkg/net/http/pprof/ for details.
+// See https://pkg.go.dev/net/http/pprof for details.
+//
+// Paths ending in a trailing slash (e.g. /debug/pprof/heap/) return 404,
+// matching the behaviour of net/http/pprof's DefaultServeMux which does
+// not register handlers for paths ending in /. The index at /debug/pprof/
+// is served, as in net/http/pprof.
 func PprofHandler(ctx *fasthttp.RequestCtx) {
+	path := ctx.Path()
+
+	// Reject paths ending in / — net/http/pprof returns 404 for these.
+	if len(path) > 1 && path[len(path)-1] == '/' && !bytes.Equal(path, indexPath) {
+		ctx.SetStatusCode(404)
+		return
+	}
+
 	ctx.Response.Header.Set("Content-Type", "text/html")
-	if strings.HasPrefix(string(ctx.Path()), "/debug/pprof/cmdline") {
+	switch {
+	case matchPprofPath(path, cmdlinePath):
 		cmdline(ctx)
-	} else if strings.HasPrefix(string(ctx.Path()), "/debug/pprof/profile") {
+	case matchPprofPath(path, profilePath):
 		profile(ctx)
-	} else if strings.HasPrefix(string(ctx.Path()), "/debug/pprof/symbol") {
+	case matchPprofPath(path, symbolPath):
 		symbol(ctx)
-	} else if strings.HasPrefix(string(ctx.Path()), "/debug/pprof/trace") {
+	case matchPprofPath(path, tracePath):
 		trace(ctx)
-	} else {
+	default:
 		for _, v := range rtp.Profiles() {
 			ppName := v.Name()
-			if strings.HasPrefix(string(ctx.Path()), "/debug/pprof/"+ppName) {
+			endpoint := []byte("/debug/pprof/" + ppName)
+			if matchPprofPath(path, endpoint) {
 				namedHandler := fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Handler(ppName).ServeHTTP)
 				namedHandler(ctx)
 				return

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"runtime"
@@ -171,11 +170,11 @@ func BenchmarkServerTimeoutError(b *testing.B) {
 	clientsCount := 10
 	requestsPerConn := 1
 	ch := make(chan struct{}, b.N)
-	n := uint32(0)
+	var n atomic.Uint32
 	responseBody := []byte("123")
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
-			if atomic.AddUint32(&n, 1)&7 == 0 {
+			if n.Add(1)&7 == 0 {
 				ctx.TimeoutError("xxx")
 				go func() {
 					ctx.Success("foobar", responseBody)
@@ -194,10 +193,11 @@ func BenchmarkServerTimeoutError(b *testing.B) {
 
 type fakeServerConn struct {
 	net.TCPConn
+
 	ln            *fakeListener
 	requestsCount int
 	pos           int
-	closed        uint32
+	closed        atomic.Bool
 }
 
 func (c *fakeServerConn) Read(b []byte) (int, error) {
@@ -236,7 +236,7 @@ func (c *fakeServerConn) RemoteAddr() net.Addr {
 }
 
 func (c *fakeServerConn) Close() error {
-	if atomic.AddUint32(&c.closed, 1) == 1 {
+	if c.closed.CompareAndSwap(false, true) {
 		c.ln.ch <- c
 	}
 	return nil
@@ -251,12 +251,12 @@ func (c *fakeServerConn) SetWriteDeadline(t time.Time) error {
 }
 
 type fakeListener struct {
-	lock            sync.Mutex
-	requestsCount   int
-	requestsPerConn int
-	request         []byte
 	ch              chan *fakeServerConn
 	done            chan struct{}
+	request         []byte
+	requestsCount   int
+	requestsPerConn int
+	lock            sync.Mutex
 	closed          bool
 }
 
@@ -275,16 +275,13 @@ func (ln *fakeListener) Accept() (net.Conn, error) {
 		ln.lock.Unlock()
 		return nil, io.EOF
 	}
-	requestsCount := ln.requestsPerConn
-	if requestsCount > ln.requestsCount {
-		requestsCount = ln.requestsCount
-	}
+	requestsCount := min(ln.requestsPerConn, ln.requestsCount)
 	ln.requestsCount -= requestsCount
 	ln.lock.Unlock()
 
 	c := <-ln.ch
 	c.requestsCount = requestsCount
-	c.closed = 0
+	c.closed.Store(false)
 	c.pos = 0
 
 	return c, nil
@@ -306,7 +303,7 @@ func newFakeListener(requestsCount, clientsCount, requestsPerConn int, request s
 		ch:              make(chan *fakeServerConn, clientsCount),
 		done:            make(chan struct{}),
 	}
-	for i := 0; i < clientsCount; i++ {
+	for range clientsCount {
 		ln.ch <- &fakeServerConn{
 			ln: ln,
 		}
@@ -317,7 +314,7 @@ func newFakeListener(requestsCount, clientsCount, requestsPerConn int, request s
 var (
 	fakeResponse = []byte("Hello, world!")
 	getRequest   = "GET /foobar?baz HTTP/1.1\r\nHost: google.com\r\nUser-Agent: aaa/bbb/ccc/ddd/eee Firefox Chrome MSIE Opera\r\n" +
-		"Referer: http://xxx.com/aaa?bbb=ccc\r\nCookie: foo=bar; baz=baraz; aa=aakslsdweriwereowriewroire\r\n\r\n"
+		"Referer: http://example.com/aaa?bbb=ccc\r\nCookie: foo=bar; baz=baraz; aa=aakslsdweriwereowriewroire\r\n\r\n"
 	postRequest = fmt.Sprintf("POST /foobar?baz HTTP/1.1\r\nHost: google.com\r\nContent-Type: foo/bar\r\nContent-Length: %d\r\n"+
 		"User-Agent: Opera Chrome MSIE Firefox and other/1.2.34\r\nReferer: http://google.com/aaaa/bbb/ccc\r\n"+
 		"Cookie: foo=bar; baz=baraz; aa=aakslsdweriwereowriewroire\r\n\r\n%s",
@@ -329,7 +326,7 @@ func benchmarkServerGet(b *testing.B, clientsCount, requestsPerConn int) {
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
 			if !ctx.IsGet() {
-				b.Fatalf("Unexpected request method: %s", ctx.Method())
+				b.Fatalf("Unexpected request method: %q", ctx.Method())
 			}
 			ctx.Success("text/plain", fakeResponse)
 			if requestsPerConn == 1 {
@@ -348,7 +345,7 @@ func benchmarkNetHTTPServerGet(b *testing.B, clientsCount, requestsPerConn int) 
 	s := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			if req.Method != MethodGet {
-				b.Fatalf("Unexpected request method: %s", req.Method)
+				b.Fatalf("Unexpected request method: %q", req.Method)
 			}
 			h := w.Header()
 			h.Set("Content-Type", "text/plain")
@@ -368,7 +365,7 @@ func benchmarkServerPost(b *testing.B, clientsCount, requestsPerConn int) {
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
 			if !ctx.IsPost() {
-				b.Fatalf("Unexpected request method: %s", ctx.Method())
+				b.Fatalf("Unexpected request method: %q", ctx.Method())
 			}
 			body := ctx.Request.Body()
 			if !bytes.Equal(body, fakeResponse) {
@@ -391,11 +388,11 @@ func benchmarkNetHTTPServerPost(b *testing.B, clientsCount, requestsPerConn int)
 	s := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			if req.Method != MethodPost {
-				b.Fatalf("Unexpected request method: %s", req.Method)
+				b.Fatalf("Unexpected request method: %q", req.Method)
 			}
-			body, err := ioutil.ReadAll(req.Body)
+			body, err := io.ReadAll(req.Body)
 			if err != nil {
-				b.Fatalf("Unexpected error: %s", err)
+				b.Fatalf("Unexpected error: %v", err)
 			}
 			req.Body.Close()
 			if !bytes.Equal(body, fakeResponse) {
@@ -455,7 +452,7 @@ func benchmarkServer(b *testing.B, s realServer, clientsCount, requestsPerConn i
 
 	select {
 	case <-ch:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testTimeout(10 * time.Second)):
 		b.Fatalf("Server.Serve() didn't stop")
 	}
 }

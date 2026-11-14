@@ -2,18 +2,20 @@ package fasthttp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"testing"
 	"time"
 )
 
 var compressTestcases = func() []string {
-	a := []string{
+	a := make([]string, 0, 4)
+	a = append(a,
 		"",
 		"foobar",
 		"выфаодлодл одлфываыв sd2 k34",
-	}
+	)
 	bigS := createFixedBody(1e4)
 	a = append(a, string(bigS))
 	return a
@@ -78,7 +80,7 @@ func testGzipBytesSingleCase(s string) error {
 
 	gunzippedS, err := AppendGunzipBytes(prefix, gzippedS[len(prefix):])
 	if err != nil {
-		return fmt.Errorf("unexpected error when uncompressing %q: %s", s, err)
+		return fmt.Errorf("unexpected error when uncompressing %q: %w", s, err)
 	}
 	if !bytes.Equal(gunzippedS[:len(prefix)], prefix) {
 		return fmt.Errorf("unexpected prefix when uncompressing %q: %q. Expecting %q", s, gunzippedS[:len(prefix)], prefix)
@@ -99,7 +101,7 @@ func testDeflateBytesSingleCase(s string) error {
 
 	inflatedS, err := AppendInflateBytes(prefix, deflatedS[len(prefix):])
 	if err != nil {
-		return fmt.Errorf("unexpected error when uncompressing %q: %s", s, err)
+		return fmt.Errorf("unexpected error when uncompressing %q: %w", s, err)
 	}
 	if !bytes.Equal(inflatedS[:len(prefix)], prefix) {
 		return fmt.Errorf("unexpected prefix when uncompressing %q: %q. Expecting %q", s, inflatedS[:len(prefix)], prefix)
@@ -165,17 +167,17 @@ func testGzipCompressSingleCase(s string) error {
 	var buf bytes.Buffer
 	zw := acquireStacklessGzipWriter(&buf, CompressDefaultCompression)
 	if _, err := zw.Write([]byte(s)); err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
-	releaseStacklessGzipWriter(zw, CompressDefaultCompression)
+	_ = releaseStacklessGzipWriter(zw, CompressDefaultCompression)
 
 	zr, err := acquireGzipReader(&buf)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
-	body, err := ioutil.ReadAll(zr)
+	body, err := io.ReadAll(zr)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
 	if string(body) != s {
 		return fmt.Errorf("unexpected string after decompression: %q. Expecting %q", body, s)
@@ -188,17 +190,17 @@ func testFlateCompressSingleCase(s string) error {
 	var buf bytes.Buffer
 	zw := acquireStacklessDeflateWriter(&buf, CompressDefaultCompression)
 	if _, err := zw.Write([]byte(s)); err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
-	releaseStacklessDeflateWriter(zw, CompressDefaultCompression)
+	_ = releaseStacklessDeflateWriter(zw, CompressDefaultCompression)
 
 	zr, err := acquireFlateReader(&buf)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
-	body, err := ioutil.ReadAll(zr)
+	body, err := io.ReadAll(zr)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %s. s=%q", err, s)
+		return fmt.Errorf("unexpected error: %w. s=%q", err, s)
 	}
 	if string(body) != s {
 		return fmt.Errorf("unexpected string after decompression: %q. Expecting %q", body, s)
@@ -209,23 +211,24 @@ func testFlateCompressSingleCase(s string) error {
 
 func testConcurrent(concurrency int, f func() error) error {
 	ch := make(chan error, concurrency)
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		go func(idx int) {
 			err := f()
 			if err != nil {
-				ch <- fmt.Errorf("error in goroutine %d: %s", idx, err)
+				ch <- fmt.Errorf("error in goroutine %d: %w", idx, err)
+				return
 			}
 			ch <- nil
 		}(i)
 	}
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		select {
 		case err := <-ch:
 			if err != nil {
 				return err
 			}
-		case <-time.After(time.Second):
-			return fmt.Errorf("timeout")
+		case <-time.After(testTimeout(time.Second)):
+			return errors.New("timeout")
 		}
 	}
 	return nil

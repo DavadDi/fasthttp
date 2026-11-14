@@ -3,21 +3,86 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
-	"fmt"
+	"html"
 	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/valyala/bytebufferpool"
 )
 
+func TestAppendQuotedArg(t *testing.T) {
+	t.Parallel()
+
+	// Sync with url.QueryEscape
+	allcases := make([]byte, 256)
+	for i := range 256 {
+		allcases[i] = byte(i)
+	}
+	res := string(AppendQuotedArg(nil, allcases))
+	expect := url.QueryEscape(string(allcases))
+	if res != expect {
+		t.Fatalf("unexpected string %q. Expecting %q.", res, expect)
+	}
+}
+
+func TestAppendQuotedArgAndPathPrefix(t *testing.T) {
+	t.Parallel()
+
+	for _, s := range []string{"", "abc", "a b", " ", "foo/bar?baz", "a%20b", "\xff\x00", "abcdefgh-ijk~lmn"} {
+		var exp []byte
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			switch {
+			case c == ' ':
+				exp = append(exp, '+')
+			case quotedArgShouldEscapeTable[c] != 0:
+				exp = append(exp, '%', upperhex[c>>4], upperhex[c&0xf])
+			default:
+				exp = append(exp, c)
+			}
+		}
+		if got := AppendQuotedArg(nil, []byte(s)); !bytes.Equal(got, exp) {
+			t.Fatalf("unexpected AppendQuotedArg(%q): %q. Expecting %q", s, got, exp)
+		}
+
+		exp = exp[:0]
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if quotedPathShouldEscapeTable[c] != 0 {
+				exp = append(exp, '%', upperhex[c>>4], upperhex[c&0xf])
+			} else {
+				exp = append(exp, c)
+			}
+		}
+		if got := appendQuotedPath(nil, []byte(s)); !bytes.Equal(got, exp) {
+			t.Fatalf("unexpected appendQuotedPath(%q): %q. Expecting %q", s, got, exp)
+		}
+	}
+}
+
 func TestAppendHTMLEscape(t *testing.T) {
 	t.Parallel()
+
+	// Sync with html.EscapeString
+	allcases := make([]byte, 256)
+	for i := range 256 {
+		allcases[i] = byte(i)
+	}
+	res := string(AppendHTMLEscape(nil, string(allcases)))
+	expect := html.EscapeString(string(allcases))
+	if res != expect {
+		t.Fatalf("unexpected string %q. Expecting %q.", res, expect)
+	}
 
 	testAppendHTMLEscape(t, "", "")
 	testAppendHTMLEscape(t, "<", "&lt;")
 	testAppendHTMLEscape(t, "a", "a")
-	testAppendHTMLEscape(t, `><"''`, "&gt;&lt;&quot;&#39;&#39;")
+	testAppendHTMLEscape(t, `><"''`, "&gt;&lt;&#34;&#39;&#39;")
 	testAppendHTMLEscape(t, "fo<b x='ss'>a</b>xxx", "fo&lt;b x=&#39;ss&#39;&gt;a&lt;/b&gt;xxx")
 }
 
@@ -31,33 +96,37 @@ func testAppendHTMLEscape(t *testing.T, s, expectedS string) {
 func TestParseIPv4(t *testing.T) {
 	t.Parallel()
 
-	testParseIPv4(t, "0.0.0.0", true)
-	testParseIPv4(t, "255.255.255.255", true)
-	testParseIPv4(t, "123.45.67.89", true)
+	testParseIPv4(t, net.IP{0}, "0.0.0.0", true)
+	testParseIPv4(t, nil, "0.0.0.0", true)
+	testParseIPv4(t, net.IP{0, 0, 0, 0, 0}, "0.0.0.0", true)
+	testParseIPv4(t, nil, "255.255.255.255", true)
+	testParseIPv4(t, nil, "123.45.67.89", true)
 
 	// ipv6 shouldn't work
-	testParseIPv4(t, "2001:4860:0:2001::68", false)
+	testParseIPv4(t, nil, "2001:4860:0:2001::68", false)
 
 	// invalid ip
-	testParseIPv4(t, "foobar", false)
-	testParseIPv4(t, "1.2.3", false)
-	testParseIPv4(t, "123.456.789.11", false)
+	testParseIPv4(t, nil, "", false)
+	testParseIPv4(t, nil, "foobar", false)
+	testParseIPv4(t, nil, "1.2.3", false)
+	testParseIPv4(t, nil, "123.456.789.11", false)
+	testParseIPv4(t, nil, "b.1.2.3", false)
+	testParseIPv4(t, nil, "1.2.3.b", false)
+	testParseIPv4(t, nil, "1.2.3.456", false)
 }
 
-func testParseIPv4(t *testing.T, ipStr string, isValid bool) {
-	ip, err := ParseIPv4(nil, []byte(ipStr))
+func testParseIPv4(t *testing.T, dst net.IP, ipStr string, isValid bool) {
+	ip, err := ParseIPv4(dst, []byte(ipStr))
 	if isValid {
 		if err != nil {
-			t.Fatalf("unexpected error when parsing ip %q: %s", ipStr, err)
+			t.Fatalf("unexpected error when parsing ip %q: %v", ipStr, err)
 		}
 		s := string(AppendIPv4(nil, ip))
 		if s != ipStr {
 			t.Fatalf("unexpected ip parsed %q. Expecting %q", s, ipStr)
 		}
-	} else {
-		if err == nil {
-			t.Fatalf("expecting error when parsing ip %q", ipStr)
-		}
+	} else if err == nil {
+		t.Fatalf("expecting error when parsing ip %q", ipStr)
 	}
 }
 
@@ -92,7 +161,7 @@ func testAppendIPv4(t *testing.T, ipStr string, isValid bool) {
 }
 
 func testAppendUint(t *testing.T, n int) {
-	expectedS := fmt.Sprintf("%d", n)
+	expectedS := strconv.Itoa(n)
 	s := AppendUint(nil, n)
 	if string(s) != expectedS {
 		t.Fatalf("unexpected uint %q. Expecting %q. n=%d", s, expectedS, n)
@@ -103,10 +172,10 @@ func testWriteHexInt(t *testing.T, n int, expectedS string) {
 	var w bytebufferpool.ByteBuffer
 	bw := bufio.NewWriter(&w)
 	if err := writeHexInt(bw, n); err != nil {
-		t.Fatalf("unexpected error when writing hex %x: %s", n, err)
+		t.Fatalf("unexpected error when writing hex %x: %v", n, err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("unexpected error when flushing hex %x: %s", n, err)
+		t.Fatalf("unexpected error when flushing hex %x: %v", n, err)
 	}
 	s := string(w.B)
 	if s != expectedS {
@@ -140,7 +209,7 @@ func testReadHexIntSuccess(t *testing.T, s string, expectedN int) {
 	br := bufio.NewReader(r)
 	n, err := readHexInt(br)
 	if err != nil {
-		t.Fatalf("unexpected error: %s. s=%q", err, s)
+		t.Fatalf("unexpected error: %v. s=%q", err, s)
 	}
 	if n != expectedN {
 		t.Fatalf("unexpected hex int %d. Expected %d. s=%q", n, expectedN, s)
@@ -168,6 +237,173 @@ func TestAppendHTTPDate(t *testing.T) {
 	}
 }
 
+func TestAppendHTTPDateMatchesTimeFormat(t *testing.T) {
+	t.Parallel()
+
+	expected := func(d time.Time) string {
+		b := d.In(time.UTC).AppendFormat(nil, time.RFC1123)
+		copy(b[len(b)-3:], "GMT")
+		return string(b)
+	}
+	check := func(d time.Time) {
+		if got, exp := string(AppendHTTPDate(nil, d)), expected(d); got != exp {
+			t.Fatalf("unexpected result for %v: %q. Expecting %q", d, got, exp)
+		}
+	}
+	for _, d := range []time.Time{
+		time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(99, time.December, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(999, time.February, 28, 12, 0, 0, 0, time.UTC),
+		time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2009, time.November, 10, 23, 0, 0, 0, time.UTC),
+		time.Date(2024, time.February, 29, 1, 2, 3, 999999999, time.FixedZone("X", 5*3600)),
+		time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(-1, time.June, 15, 6, 7, 8, 0, time.UTC),
+		{},
+	} {
+		check(d)
+	}
+	d := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for range 5000 {
+		check(d)
+		d = d.Add(37*time.Hour + 41*time.Minute + 53*time.Second)
+	}
+}
+
+func TestParseHTTPDateCompatibility(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name              string
+		value             string
+		expectedError     bool
+		expectedRoundTrip bool
+	}{
+		{name: "gmt-fast-path", value: "Tue, 10 Nov 2009 23:00:00 GMT", expectedRoundTrip: true},
+		{name: "epoch", value: "Thu, 01 Jan 1970 00:00:00 GMT", expectedRoundTrip: true},
+		{name: "year-boundary", value: "Fri, 31 Dec 1999 23:59:59 GMT", expectedRoundTrip: true},
+		{name: "leap-year", value: "Mon, 29 Feb 2016 12:34:56 GMT", expectedRoundTrip: true},
+		{name: "utc-fallback", value: "Tue, 10 Nov 2009 23:00:00 UTC", expectedError: true},
+		{name: "mixedcase-weekday-month", value: "tUe, 10 nOv 2009 23:00:00 GMT"},
+		{name: "day-zero", value: "Tue, 00 Nov 2009 23:00:00 GMT", expectedError: true},
+		{name: "invalid-day", value: "Tue, 31 Feb 2009 23:00:00 GMT", expectedError: true},
+		{name: "invalid-weekday", value: "Xxx, 10 Nov 2009 23:00:00 GMT", expectedError: true},
+		{name: "invalid-month", value: "Tue, 10 Foo 2009 23:00:00 GMT", expectedError: true},
+		{name: "invalid-hour", value: "Tue, 10 Nov 2009 24:00:00 GMT", expectedError: true},
+		{name: "invalid-minute", value: "Tue, 10 Nov 2009 23:60:00 GMT", expectedError: true},
+		{name: "invalid-second", value: "Tue, 10 Nov 2009 23:00:60 GMT", expectedError: true},
+		{name: "invalid-separator", value: "Tue 10 Nov 2009 23:00:00 GMT", expectedError: true},
+		{name: "invalid-time-separator", value: "Tue, 10 Nov 2009 23-00-00 GMT", expectedError: true},
+		{name: "non-leap-year", value: "Tue, 29 Feb 2019 23:00:00 GMT", expectedError: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, gotErr := ParseHTTPDate([]byte(tc.value))
+			want, wantErr := time.Parse(http.TimeFormat, tc.value)
+
+			if (gotErr != nil) != (wantErr != nil) {
+				t.Fatalf("error mismatch for %q: ParseHTTPDate err=%v, ParseInLocation err=%v", tc.value, gotErr, wantErr)
+			}
+			if tc.expectedError != (gotErr != nil) {
+				t.Fatalf("unexpected error state for %q: gotErr=%v, expectedError=%v", tc.value, gotErr, tc.expectedError)
+			}
+			if gotErr != nil {
+				return
+			}
+			if !got.Equal(want) {
+				t.Fatalf("parsed time mismatch for %q: got=%v want=%v", tc.value, got, want)
+			}
+			if tc.expectedRoundTrip && got.Format(time.RFC1123) != tc.value {
+				t.Fatalf("unexpected formatted date %q. Expecting %q", got.Format(time.RFC1123), tc.value)
+			}
+		})
+	}
+}
+
+func TestParseHTTPDateObsoleteFormats(t *testing.T) {
+	t.Parallel()
+
+	// The examples from RFC 9110, section 5.6.7 all denote the same instant.
+	want := time.Date(1994, time.November, 6, 8, 49, 37, 0, time.UTC)
+	for _, s := range []string{
+		"Sun, 06 Nov 1994 08:49:37 GMT",
+		"Sunday, 06-Nov-94 08:49:37 GMT",
+		"Sun Nov  6 08:49:37 1994",
+	} {
+		got, err := ParseHTTPDate([]byte(s))
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", s, err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("unexpected time for %q: %v. Expecting %v", s, got, want)
+		}
+	}
+}
+
+func BenchmarkParseHTTPDate(b *testing.B) {
+	date := []byte("Tue, 10 Nov 2009 23:00:00 GMT")
+
+	b.Run("fast-path", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_, _ = ParseHTTPDate(date)
+		}
+	})
+
+	b.Run("stdlib-only", func(b *testing.B) {
+		b.ReportAllocs()
+		s := string(date)
+		for range b.N {
+			_, _ = time.Parse(http.TimeFormat, s)
+		}
+	})
+}
+
+func FuzzParseHTTPDate(f *testing.F) {
+	// Seed corpus: valid RFC1123 dates.
+	seeds := []string{
+		"Tue, 10 Nov 2009 23:00:00 GMT",
+		"Thu, 01 Jan 1970 00:00:00 GMT",
+		"Fri, 31 Dec 1999 23:59:59 GMT",
+		"Mon, 29 Feb 2016 12:34:56 GMT",
+		"Sun, 06 Nov 1994 08:49:37 GMT",
+		"Sunday, 06-Nov-94 08:49:37 GMT",
+		"Sun Nov  6 08:49:37 1994",
+		// Invalid inputs to exercise rejection paths.
+		"Tue, 10 Nov 2009 23:00:00 UTC",
+		"Tue, 31 Feb 2009 23:00:00 GMT",
+		"Xxx, 10 Nov 2009 23:00:00 GMT",
+		"Tue, 00 Nov 2009 23:00:00 GMT",
+		"Tue, 10 Nov 2009 24:00:00 GMT",
+		"not a date at all",
+		"",
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, s string) {
+		b := []byte(s)
+
+		// Reference: http.ParseTime is what ParseHTTPDate falls back to.
+		stdTime, stdErr := http.ParseTime(s)
+
+		// The public API must always agree with http.ParseTime.
+		got, gotErr := ParseHTTPDate(b)
+		if (gotErr != nil) != (stdErr != nil) {
+			t.Fatalf("ParseHTTPDate error mismatch for %q: got err=%v, std err=%v", s, gotErr, stdErr)
+		}
+		if gotErr == nil && !got.Equal(stdTime) {
+			t.Fatalf("ParseHTTPDate time mismatch for %q: got=%v std=%v", s, got, stdTime)
+		}
+	})
+}
+
 func TestParseUintError(t *testing.T) {
 	t.Parallel()
 
@@ -191,6 +427,91 @@ func TestParseUintError(t *testing.T) {
 	testParseUintError(t, "1234567890123456789012")
 }
 
+// The digit gate in parseUintBuf has to be conservative on whatever int size
+// the build targets: a number of exactly maxSafeIntDigits digits must always
+// fit in an int, and one digit more must be able to overflow it.
+func TestMaxSafeIntDigits(t *testing.T) {
+	t.Parallel()
+
+	fits := strings.Repeat("9", maxSafeIntDigits)
+	if _, err := strconv.ParseUint(fits, 10, strconv.IntSize-1); err != nil {
+		t.Fatalf("%d nines must fit in an int on this platform: %v", maxSafeIntDigits, err)
+	}
+	if _, err := strconv.ParseUint(fits+"9", 10, strconv.IntSize-1); err == nil {
+		t.Fatalf("%d nines must not fit in an int on this platform", maxSafeIntDigits+1)
+	}
+}
+
+// ParseUint must agree with the standard library about which unsigned decimal
+// strings fit in an int and about the value when they do. A table of round
+// hostile numbers is not enough: the overflow this pins only shows up in a
+// narrow band of values where 10*v wraps back above v, and that band sits in a
+// different place for each int size, so both are covered below.
+func TestParseUintMatchesStrconv(t *testing.T) {
+	t.Parallel()
+
+	values := []string{
+		"0", "1", "9", "10", "255", "1000", "0123", "00000000000000000001",
+		// Wrap band for a 32-bit int: the pre-fix parser returned 705032704 for
+		// "5000000000" with no error. All of these are in range on a 64-bit
+		// platform, so the oracle decides what correct means for each build.
+		"2147483647", "2147483648", "5000000000", "6000000000", "9999999999",
+		"10000000000", "15000000000", "48000000000",
+		// Wrap band for a 64-bit int.
+		"9223372036854775806", "9223372036854775807", "9223372036854775808",
+		"18446744073709551615", "18446744073709551616",
+		"21000000000000000000", "22000000000000000000", "23000000000000000000",
+		"24000000000000000000", "25000000000000000000", "26000000000000000000",
+		"27000000000000000000", "41000000000000000000",
+		"210000000000000000000", "230000000000000000000", "410000000000000000000",
+		"4100000000000000000000",
+		"99999999999999999999", "100000000000000000000",
+	}
+
+	for _, s := range values {
+		got, gotErr := ParseUint([]byte(s))
+		// A bit size one below the int size accepts exactly the strings that name
+		// a non-negative int. ParseUint is the oracle rather than ParseInt, which
+		// also accepts the leading sign that fasthttp's ParseUint rejects.
+		want, wantErr := strconv.ParseUint(s, 10, strconv.IntSize-1)
+
+		if (gotErr != nil) != (wantErr != nil) {
+			t.Fatalf("ParseUint(%q) = (%d, %v), strconv.ParseUint = (%d, %v): "+
+				"they disagree about whether the value is in range", s, got, gotErr, want, wantErr)
+		}
+		if gotErr == nil && uint64(got) != want {
+			t.Fatalf("ParseUint(%q) = %d. Expecting %d", s, got, want)
+		}
+	}
+}
+
+// The parsed length must not be trusted as an int when it never fit one: a
+// Content-Length that overflows is an error on both the request and the
+// response side, not a wrapped value.
+func TestParseContentLengthRejectsOverflow(t *testing.T) {
+	t.Parallel()
+
+	for _, cl := range []string{"25000000000000000000", "41000000000000000000", "9223372036854775808"} {
+		if n, err := parseContentLength([]byte(cl)); err == nil {
+			t.Fatalf("parseContentLength(%q) = %d with no error. Expecting an error", cl, n)
+		}
+
+		var h RequestHeader
+		raw := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: " + cl + "\r\n\r\n"
+		if err := h.Read(bufio.NewReader(strings.NewReader(raw))); err == nil {
+			t.Fatalf("RequestHeader.Read accepted Content-Length %q as %d. Expecting an error",
+				cl, h.ContentLength())
+		}
+
+		var rh ResponseHeader
+		rawResp := "HTTP/1.1 200 OK\r\nContent-Length: " + cl + "\r\n\r\n"
+		if err := rh.Read(bufio.NewReader(strings.NewReader(rawResp))); err == nil {
+			t.Fatalf("ResponseHeader.Read accepted Content-Length %q as %d. Expecting an error",
+				cl, rh.ContentLength())
+		}
+	}
+}
+
 func TestParseUfloatSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -202,6 +523,12 @@ func TestParseUfloatSuccess(t *testing.T) {
 	testParseUfloatSuccess(t, "1234e2", 1234e2)
 	testParseUfloatSuccess(t, "1234E-5", 1234e-5)
 	testParseUfloatSuccess(t, "1.234e+3", 1.234e+3)
+	testParseUfloatSuccess(t, "1234e23", 1234e23)
+	testParseUfloatSuccess(t, "1.234e+32", 1.234e+32)
+	testParseUfloatSuccess(t, "123456789123456789.987654321", 123456789123456789.987654321)
+	testParseUfloatSuccess(t, "1.23456789123456789987654321", 1.23456789123456789987654321)
+	testParseUfloatSuccess(t, "340282346638528859811704183484516925440", 340282346638528859811704183484516925440)
+	testParseUfloatSuccess(t, "00000000000000000001", 1)
 }
 
 func TestParseUfloatError(t *testing.T) {
@@ -231,6 +558,10 @@ func TestParseUfloatError(t *testing.T) {
 
 	// missing exponent
 	testParseUfloatError(t, "123534e")
+
+	// negative number
+	testParseUfloatError(t, "-1")
+	testParseUfloatError(t, "-Inf")
 }
 
 func testParseUfloatError(t *testing.T, s string) {
@@ -246,7 +577,7 @@ func testParseUfloatError(t *testing.T, s string) {
 func testParseUfloatSuccess(t *testing.T, s string, expectedF float64) {
 	f, err := ParseUfloat([]byte(s))
 	if err != nil {
-		t.Fatalf("Unexpected error when parsing %q: %s", s, err)
+		t.Fatalf("Unexpected error when parsing %q: %v", s, err)
 	}
 	delta := f - expectedF
 	if delta < 0 {
@@ -270,7 +601,7 @@ func testParseUintError(t *testing.T, s string) {
 func testParseUintSuccess(t *testing.T, s string, expectedN int) {
 	n, err := ParseUint([]byte(s))
 	if err != nil {
-		t.Fatalf("Unexpected error when parsing %q: %s", s, err)
+		t.Fatalf("Unexpected error when parsing %q: %v", s, err)
 	}
 	if n != expectedN {
 		t.Fatalf("Unexpected value %d. Expected %d. num=%q", n, expectedN, s)
@@ -317,5 +648,29 @@ func testAppendUnquotedArg(t *testing.T, s, expectedS string) {
 	unquotedS := AppendUnquotedArg(nil, quotedS)
 	if s != string(unquotedS) {
 		t.Fatalf("Unexpected AppendUnquotedArg(AppendQuotedArg(%q))=%q, want %q", s, unquotedS, s)
+	}
+}
+
+func TestLowercaseBytesMatchesTable(t *testing.T) {
+	t.Parallel()
+
+	for n := 0; n <= 24; n++ {
+		for c := range 256 {
+			for pos := 0; pos < n; pos++ {
+				b := make([]byte, n)
+				for i := range b {
+					b[i] = 'A' + byte(i%26)
+				}
+				b[pos] = byte(c)
+				exp := make([]byte, n)
+				for i := range b {
+					exp[i] = toLowerTable[b[i]]
+				}
+				lowercaseBytes(b)
+				if !bytes.Equal(b, exp) {
+					t.Fatalf("unexpected result for byte %#x at %d of %d: %q. Expecting %q", c, pos, n, b, exp)
+				}
+			}
+		}
 	}
 }

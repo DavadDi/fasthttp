@@ -1,4 +1,4 @@
-// +build amd64 arm64 ppc64 ppc64le
+//go:build amd64 || arm64 || ppc64 || ppc64le || riscv64 || s390x
 
 package fasthttp
 
@@ -22,7 +22,7 @@ func TestAppendUint(t *testing.T) {
 	testAppendUint(t, 123)
 	testAppendUint(t, 0x7fffffffffffffff)
 
-	for i := 0; i < 2345; i++ {
+	for i := range 2345 {
 		testAppendUint(t, i)
 	}
 }

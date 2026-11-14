@@ -1,0 +1,1690 @@
+package fasthttp
+
+import (
+	"bufio"
+	"bytes"
+	"embed"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+)
+
+//go:embed fasthttputil fs.go README.md testdata examples
+var fsTestFilesystem embed.FS
+
+func TestFSServeFileHead(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.Header.SetMethod(MethodHead)
+	req.SetRequestURI("http://foobar.com/baz")
+	ctx.Init(&req, nil, nil)
+
+	ServeFS(&ctx, fsTestFilesystem, "fs.go")
+
+	var resp Response
+	resp.SkipBody = true
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if len(ce) > 0 {
+		t.Fatalf("Unexpected 'Content-Encoding' %q", ce)
+	}
+
+	body := resp.Body()
+	if len(body) > 0 {
+		t.Fatalf("unexpected response body %q. Expecting empty body", body)
+	}
+
+	expectedBody, err := getFileContents("/fs.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	contentLength := resp.Header.ContentLength()
+	if contentLength != len(expectedBody) {
+		t.Fatalf("unexpected Content-Length: %d. expecting %d", contentLength, len(expectedBody))
+	}
+}
+
+func TestServeFSCreatesNoCacheCleaner(t *testing.T) {
+	testFS := fstest.MapFS{
+		"index.txt": {Data: []byte("body")},
+	}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	const calls = 25
+	for range calls {
+		var ctx RequestCtx
+		var req Request
+		req.SetRequestURI("http://foobar.com/original")
+		ctx.Init(&req, nil, TestLogger{t})
+
+		ServeFS(&ctx, testFS, "index.txt")
+		if ctx.Response.StatusCode() != StatusOK {
+			t.Fatalf("unexpected status code %d. expecting %d", ctx.Response.StatusCode(), StatusOK)
+		}
+	}
+
+	// ServeFS skips the cache, so the expected delta is 0 without any GC. The
+	// slack absorbs unrelated test goroutines dying around the sample.
+	if leaked := runtime.NumGoroutine() - before; leaked > 3 {
+		t.Fatalf("ServeFS started %d cache cleaner goroutines; expected none", leaked)
+	}
+}
+
+func TestFSCacheCleanerIsReclaimed(t *testing.T) {
+	testFS := fstest.MapFS{
+		"index.txt": {Data: []byte("body")},
+	}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	const handlers = 25
+	for range handlers {
+		h := (&FS{FS: testFS, AllowEmptyRoot: true}).NewRequestHandler()
+
+		var ctx RequestCtx
+		var req Request
+		req.SetRequestURI("http://foobar.com/index.txt")
+		ctx.Init(&req, nil, TestLogger{t})
+
+		h(&ctx)
+		if ctx.Response.StatusCode() != StatusOK {
+			t.Fatalf("unexpected status code %d. expecting %d", ctx.Response.StatusCode(), StatusOK)
+		}
+	}
+
+	// A cached FS does start a cleaner, so this one has to wait for the cleanup
+	// registered in initRequestHandler to run.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		runtime.Gosched()
+
+		if leaked := runtime.NumGoroutine() - before; leaked <= 3 {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if leaked := runtime.NumGoroutine() - before; leaked > 3 {
+		t.Fatalf("cache cleaners of %d discarded handlers were not reclaimed; %d goroutines left", handlers, leaked)
+	}
+}
+
+func TestServeFSLiteral(t *testing.T) {
+	t.Parallel()
+
+	testFS := fstest.MapFS{
+		"space name.txt":     {Data: []byte("space")},
+		"hash#name.txt":      {Data: []byte("hash")},
+		"percent%61name.txt": {Data: []byte("percent")},
+		"query?name.txt":     {Data: []byte("query")},
+	}
+
+	for name, file := range testFS {
+		t.Run(name, func(t *testing.T) {
+			var ctx RequestCtx
+			var req Request
+			req.SetRequestURI("http://foobar.com/original")
+			ctx.Init(&req, nil, nil)
+
+			ServeFSLiteral(&ctx, testFS, name)
+
+			resp := readResponseFromCtx(t, &ctx, false)
+			if resp.StatusCode() != StatusOK {
+				t.Fatalf("unexpected status code %d. expecting %d", resp.StatusCode(), StatusOK)
+			}
+			if !bytes.Equal(resp.Body(), file.Data) {
+				t.Fatalf("unexpected body %q. expecting %q", resp.Body(), file.Data)
+			}
+		})
+	}
+}
+
+func TestServeFSSpecialCharsNotLiteral(t *testing.T) {
+	t.Parallel()
+
+	testFS := fstest.MapFS{
+		"hash#name.txt":      {Data: []byte("hash")},
+		"percent%61name.txt": {Data: []byte("percent")},
+		"query?name.txt":     {Data: []byte("query")},
+	}
+
+	for name := range testFS {
+		t.Run(name, func(t *testing.T) {
+			var ctx RequestCtx
+			var req Request
+			req.SetRequestURI("http://foobar.com/original")
+			ctx.Init(&req, nil, TestLogger{t})
+
+			ServeFS(&ctx, testFS, name)
+
+			resp := readResponseFromCtx(t, &ctx, false)
+			if resp.StatusCode() == StatusOK {
+				t.Fatalf("ServeFS should fail for special-character path %q without literal mode, but got 200", name)
+			}
+		})
+	}
+}
+
+func TestFSServeFileCompressed(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, nil)
+
+	var resp Response
+
+	expectedBody, err := getFileContents("/fs.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// should prefer brotli over zstd, gzip and ignore unknown encoding
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, br, wompwomp")
+	ServeFS(&ctx, fsTestFilesystem, "fs.go")
+
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if string(ce) != "br" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "br")
+	}
+
+	vary := resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err := resp.BodyUnbrotli()
+	if err != nil {
+		t.Fatalf("unexpected error on unbrotli response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expected len=%d", len(body), len(expectedBody))
+	}
+
+	// should prefer zstd over gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, wompwomp")
+	ServeFS(&ctx, fsTestFilesystem, "fs.go")
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "zstd" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "zstd")
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyUnzstd()
+	if err != nil {
+		t.Fatalf("unexpected error on unzstd response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expected len=%d", len(body), len(expectedBody))
+	}
+
+	// should prefer gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, wompwomp")
+	ServeFS(&ctx, fsTestFilesystem, "fs.go")
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "gzip" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "gzip")
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyGunzip()
+	if err != nil {
+		t.Fatalf("unexpected error on gunzip response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expected len=%d", len(body), len(expectedBody))
+	}
+}
+
+func TestFSServeFileUncompressed(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, nil)
+
+	var resp Response
+
+	expectedBody, err := getFileContents("/fs.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, br, wompwomp")
+	ServeFileUncompressed(&ctx, "fs.go")
+
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if len(ce) > 0 {
+		t.Fatalf("unexpected 'Content-Encoding': %q. Expecting \"\"", string(ce))
+	}
+
+	vary := resp.Header.PeekBytes(strVary)
+	if len(vary) > 0 {
+		t.Fatalf("unexpected 'Vary': %q. Expecting \"\"", string(vary))
+	}
+
+	body := resp.Body()
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d", len(body), len(expectedBody))
+	}
+}
+
+func TestFSFSByteRangeConcurrent(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:              fsTestFilesystem,
+		Root:            "",
+		AcceptByteRange: true,
+		CleanStop:       stop,
+	}
+	h := fs.NewRequestHandler()
+
+	concurrency := 10
+	ch := make(chan struct{}, concurrency)
+	for range concurrency {
+		go func() {
+			for range 5 {
+				testFSByteRange(t, h, "/fs.go")
+				testFSByteRange(t, h, "/README.md")
+			}
+			ch <- struct{}{}
+		}()
+	}
+
+	for range concurrency {
+		select {
+		case <-time.After(testTimeout(time.Second)):
+			t.Fatalf("timeout")
+		case <-ch:
+		}
+	}
+}
+
+func TestFSFSByteRangeSingleThread(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:              fsTestFilesystem,
+		Root:            ".",
+		AcceptByteRange: true,
+		CleanStop:       stop,
+	}
+	h := fs.NewRequestHandler()
+
+	testFSByteRange(t, h, "/fs.go")
+	testFSByteRange(t, h, "/README.md")
+}
+
+func TestFSFSCompressConcurrent(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:                 fsTestFilesystem,
+		Root:               ".",
+		GenerateIndexPages: true,
+		Compress:           true,
+		CompressBrotli:     true,
+		CompressZstd:       true,
+		CleanStop:          stop,
+	}
+	h := fs.NewRequestHandler()
+
+	concurrency := 4
+	ch := make(chan struct{}, concurrency)
+	for range concurrency {
+		go func() {
+			for range 5 {
+				testFSFSCompress(t, h, "/fs.go")
+				testFSFSCompress(t, h, "/examples/")
+				testFSFSCompress(t, h, "/README.md")
+			}
+			ch <- struct{}{}
+		}()
+	}
+
+	for range concurrency {
+		select {
+		case <-ch:
+		case <-time.After(testTimeout(time.Second * 4)):
+			t.Fatalf("timeout")
+		}
+	}
+}
+
+func TestFSFSCompressSingleThread(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:                 fsTestFilesystem,
+		Root:               ".",
+		GenerateIndexPages: true,
+		Compress:           true,
+		CompressBrotli:     true,
+		CompressZstd:       true,
+		CleanStop:          stop,
+	}
+	h := fs.NewRequestHandler()
+
+	testFSFSCompress(t, h, "/fs.go")
+	testFSFSCompress(t, h, "/examples/")
+	testFSFSCompress(t, h, "/README.md")
+}
+
+func testFSFSCompress(t *testing.T, h RequestHandler, filePath string) {
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, nil)
+
+	var resp Response
+
+	// get uncompressed
+	ctx.Request.SetRequestURI(filePath)
+	h(&ctx)
+
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if len(ce) > 0 {
+		t.Fatalf("unexpected 'Content-Encoding': %q. Expecting \"\"", string(ce))
+	}
+
+	vary := resp.Header.PeekBytes(strVary)
+	if len(vary) > 0 {
+		t.Fatalf("unexpected 'Vary': %q. Expecting \"\"", string(vary))
+	}
+
+	expectedBody := bytes.Clone(resp.Body())
+
+	// should prefer brotli over zstd, gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI(filePath)
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, br, wompwomp")
+	h(&ctx)
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v. filePath=%q", err, filePath)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d. filePath=%q", resp.StatusCode(), StatusOK, filePath)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "br" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q. filePath=%q", string(ce), "br", filePath)
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err := resp.BodyUnbrotli()
+	if err != nil {
+		t.Fatalf("unexpected error on unbrotli response body: %v. filePath=%q", err, filePath)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d. filePath=%q", len(body), len(expectedBody), filePath)
+	}
+
+	// should prefer zstd over gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI(filePath)
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, wompwomp")
+	h(&ctx)
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v. filePath=%q", err, filePath)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d. filePath=%q", resp.StatusCode(), StatusOK, filePath)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "zstd" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q. filePath=%q", string(ce), "zstd", filePath)
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyUnzstd()
+	if err != nil {
+		t.Fatalf("unexpected error on unzstd response body: %v. filePath=%q", err, filePath)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d. filePath=%q", len(body), len(expectedBody), filePath)
+	}
+
+	// should prefer gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI(filePath)
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, wompwomp")
+	h(&ctx)
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v. filePath=%q", err, filePath)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d. filePath=%q", resp.StatusCode(), StatusOK, filePath)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "gzip" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q. filePath=%q", string(ce), "gzip", filePath)
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyGunzip()
+	if err != nil {
+		t.Fatalf("unexpected error on gunzip response body: %v. filePath=%q", err, filePath)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d. filePath=%q", len(body), len(expectedBody), filePath)
+	}
+}
+
+func TestFSServeFileContentType(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.Header.SetMethod(MethodGet)
+	req.SetRequestURI("http://foobar.com/baz")
+	ctx.Init(&req, nil, nil)
+
+	ServeFS(&ctx, fsTestFilesystem, "testdata/test.png")
+
+	var resp Response
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []byte("image/png")
+	if !bytes.Equal(resp.Header.ContentType(), expected) {
+		t.Fatalf("Unexpected Content-Type, expected: %q got %q", expected, resp.Header.ContentType())
+	}
+}
+
+func TestFSServeFileDirectoryRedirect(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.SetRequestURI("http://foobar.com")
+	ctx.Init(&req, nil, nil)
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, fsTestFilesystem, "fasthttputil")
+	if ctx.Response.StatusCode() != StatusFound {
+		t.Fatalf("Unexpected status code %d for directory '/fasthttputil' without trailing slash. Expecting %d.", ctx.Response.StatusCode(), StatusFound)
+	}
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, fsTestFilesystem, "fasthttputil/")
+	if ctx.Response.StatusCode() != StatusOK {
+		t.Fatalf("Unexpected status code %d for directory '/fasthttputil/' with trailing slash. Expecting %d.", ctx.Response.StatusCode(), StatusOK)
+	}
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, fsTestFilesystem, "fs.go")
+	if ctx.Response.StatusCode() != StatusOK {
+		t.Fatalf("Unexpected status code %d for file '/fs.go'. Expecting %d.", ctx.Response.StatusCode(), StatusOK)
+	}
+}
+
+var dirTestFilesystem = os.DirFS(".")
+
+func TestDirFSServeFileHead(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.Header.SetMethod(MethodHead)
+	req.SetRequestURI("http://foobar.com/baz")
+	ctx.Init(&req, nil, nil)
+
+	ServeFS(&ctx, dirTestFilesystem, "fs.go")
+
+	var resp Response
+	resp.SkipBody = true
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if len(ce) > 0 {
+		t.Fatalf("Unexpected 'Content-Encoding' %q", ce)
+	}
+
+	body := resp.Body()
+	if len(body) > 0 {
+		t.Fatalf("unexpected response body %q. Expecting empty body", body)
+	}
+
+	expectedBody, err := getFileContents("/fs.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	contentLength := resp.Header.ContentLength()
+	if contentLength != len(expectedBody) {
+		t.Fatalf("unexpected Content-Length: %d. expecting %d", contentLength, len(expectedBody))
+	}
+}
+
+func TestDirFSServeFileCompressed(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, nil)
+
+	var resp Response
+
+	expectedBody, err := getFileContents("/fs.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// should prefer brotli over zstd, gzip and ignore unknown encoding
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, br, wompwomp")
+	ServeFS(&ctx, dirTestFilesystem, "fs.go")
+
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce := resp.Header.ContentEncoding()
+	if string(ce) != "br" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "br")
+	}
+
+	vary := resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err := resp.BodyUnbrotli()
+	if err != nil {
+		t.Fatalf("unexpected error on unbrotli response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d", len(body), len(expectedBody))
+	}
+
+	// should prefer zstd over gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, zstd, wompwomp")
+	ServeFS(&ctx, dirTestFilesystem, "fs.go")
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "zstd" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "zstd")
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyUnzstd()
+	if err != nil {
+		t.Fatalf("unexpected error on unzstd response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d", len(body), len(expectedBody))
+	}
+
+	// should prefer gzip and ignore unknown encoding
+	ctx.Request.Reset()
+	ctx.Request.SetRequestURI("http://foobar.com/baz")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip, wompwomp")
+	ServeFS(&ctx, dirTestFilesystem, "fs.go")
+
+	s = ctx.Response.String()
+	br = bufio.NewReader(bytes.NewBufferString(s))
+	if err = resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", resp.StatusCode(), StatusOK)
+	}
+
+	ce = resp.Header.ContentEncoding()
+	if string(ce) != "gzip" {
+		t.Fatalf("unexpected 'Content-Encoding' %q. Expecting %q", string(ce), "gzip")
+	}
+
+	vary = resp.Header.PeekBytes(strVary)
+	if !bytes.Equal(vary, strAcceptEncoding) {
+		t.Fatalf("unexpected 'Vary': %q. Expecting %q", string(vary), HeaderAcceptEncoding)
+	}
+
+	body, err = resp.BodyGunzip()
+	if err != nil {
+		t.Fatalf("unexpected error on gunzip response body: %v", err)
+	}
+	if !bytes.Equal(body, expectedBody) {
+		t.Fatalf("unexpected body: len=%d. Expecting len=%d", len(body), len(expectedBody))
+	}
+}
+
+func TestDirFSFSByteRangeConcurrent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:              dirTestFilesystem,
+		Root:            "",
+		AcceptByteRange: true,
+		CleanStop:       stop,
+	}
+	h := fs.NewRequestHandler()
+
+	concurrency := 10
+	ch := make(chan struct{}, concurrency)
+	for range concurrency {
+		go func() {
+			for range 5 {
+				testFSByteRange(t, h, "/fs.go")
+				testFSByteRange(t, h, "/README.md")
+			}
+			ch <- struct{}{}
+		}()
+	}
+
+	for range concurrency {
+		select {
+		case <-time.After(testTimeout(time.Second)):
+			t.Fatalf("timeout")
+		case <-ch:
+		}
+	}
+}
+
+func TestDirFSFSByteRangeSingleThread(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:              dirTestFilesystem,
+		Root:            ".",
+		AcceptByteRange: true,
+		CleanStop:       stop,
+	}
+	h := fs.NewRequestHandler()
+
+	testFSByteRange(t, h, "/fs.go")
+	testFSByteRange(t, h, "/README.md")
+}
+
+func TestDirFSFSCompressConcurrent(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:                 dirTestFilesystem,
+		Root:               ".",
+		GenerateIndexPages: true,
+		Compress:           true,
+		CompressBrotli:     true,
+		CompressZstd:       true,
+		CleanStop:          stop,
+	}
+	h := fs.NewRequestHandler()
+
+	concurrency := 4
+	ch := make(chan struct{}, concurrency)
+	for range concurrency {
+		go func() {
+			for range 5 {
+				testFSFSCompress(t, h, "/fs.go")
+				testFSFSCompress(t, h, "/examples/")
+				testFSFSCompress(t, h, "/README.md")
+			}
+			ch <- struct{}{}
+		}()
+	}
+
+	for range concurrency {
+		select {
+		case <-ch:
+		case <-time.After(testTimeout(time.Second * 2)):
+			t.Fatalf("timeout")
+		}
+	}
+}
+
+func TestDirFSFSCompressSingleThread(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		FS:                 dirTestFilesystem,
+		Root:               ".",
+		GenerateIndexPages: true,
+		Compress:           true,
+		CompressBrotli:     true,
+		CompressZstd:       true,
+		CleanStop:          stop,
+	}
+	h := fs.NewRequestHandler()
+
+	testFSFSCompress(t, h, "/fs.go")
+	testFSFSCompress(t, h, "/examples/")
+	testFSFSCompress(t, h, "/README.md")
+}
+
+func TestDirFSServeFileContentType(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.Header.SetMethod(MethodGet)
+	req.SetRequestURI("http://foobar.com/baz")
+	ctx.Init(&req, nil, nil)
+
+	ServeFS(&ctx, dirTestFilesystem, "testdata/test.png")
+
+	var resp Response
+	s := ctx.Response.String()
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := resp.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []byte("image/png")
+	if !bytes.Equal(resp.Header.ContentType(), expected) {
+		t.Fatalf("Unexpected Content-Type, expected: %q got %q", expected, resp.Header.ContentType())
+	}
+}
+
+func TestDirFSServeFileDirectoryRedirect(t *testing.T) {
+	t.Parallel()
+
+	var ctx RequestCtx
+	var req Request
+	req.SetRequestURI("http://foobar.com")
+	ctx.Init(&req, nil, nil)
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, dirTestFilesystem, "fasthttputil")
+	if ctx.Response.StatusCode() != StatusFound {
+		t.Fatalf("Unexpected status code %d for directory '/fasthttputil' without trailing slash. Expecting %d.", ctx.Response.StatusCode(), StatusFound)
+	}
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, dirTestFilesystem, "fasthttputil/")
+	if ctx.Response.StatusCode() != StatusOK {
+		t.Fatalf("Unexpected status code %d for directory '/fasthttputil/' with trailing slash. Expecting %d.", ctx.Response.StatusCode(), StatusOK)
+	}
+
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ServeFS(&ctx, dirTestFilesystem, "fs.go")
+	if ctx.Response.StatusCode() != StatusOK {
+		t.Fatalf("Unexpected status code %d for file '/fs.go'. Expecting %d.", ctx.Response.StatusCode(), StatusOK)
+	}
+}
+
+func TestFSFSGenerateIndexOsDirFS(t *testing.T) {
+	t.Parallel()
+
+	t.Run("dir fs", func(t *testing.T) {
+		t.Parallel()
+
+		fs := &FS{
+			FS:                 dirTestFilesystem,
+			Root:               ".",
+			GenerateIndexPages: true,
+		}
+		h := fs.NewRequestHandler()
+
+		var ctx RequestCtx
+		var req Request
+		ctx.Init(&req, nil, nil)
+
+		h(&ctx)
+
+		cases := []string{"/", "//", ""}
+		for _, c := range cases {
+			ctx.Request.Reset()
+			ctx.Response.Reset()
+
+			req.Header.SetMethod(MethodGet)
+			req.SetRequestURI("http://foobar.com" + c)
+			h(&ctx)
+
+			if ctx.Response.StatusCode() != StatusOK {
+				t.Fatalf("unexpected status code %d for path %q. Expecting %d", ctx.Response.StatusCode(), c, StatusOK)
+			}
+
+			if !bytes.Contains(ctx.Response.Body(), []byte("fasthttputil")) {
+				t.Fatalf("unexpected body %q. Expecting to contain %q", ctx.Response.Body(), "fasthttputil")
+			}
+
+			if !bytes.Contains(ctx.Response.Body(), []byte("fs.go")) {
+				t.Fatalf("unexpected body %q. Expecting to contain %q", ctx.Response.Body(), "fs.go")
+			}
+		}
+	})
+
+	t.Run("embed fs", func(t *testing.T) {
+		t.Parallel()
+
+		fs := &FS{
+			FS:                 fsTestFilesystem,
+			Root:               ".",
+			GenerateIndexPages: true,
+		}
+		h := fs.NewRequestHandler()
+
+		var ctx RequestCtx
+		var req Request
+		ctx.Init(&req, nil, nil)
+
+		h(&ctx)
+
+		cases := []string{"/", "//", ""}
+		for _, c := range cases {
+			ctx.Request.Reset()
+			ctx.Response.Reset()
+
+			req.Header.SetMethod(MethodGet)
+			req.SetRequestURI("http://foobar.com" + c)
+			h(&ctx)
+
+			if ctx.Response.StatusCode() != StatusOK {
+				t.Fatalf("unexpected status code %d for path %q. Expecting %d", ctx.Response.StatusCode(), c, StatusOK)
+			}
+
+			if !bytes.Contains(ctx.Response.Body(), []byte("fasthttputil")) {
+				t.Fatalf("unexpected body %q. Expecting to contain %q", ctx.Response.Body(), "fasthttputil")
+			}
+
+			if !bytes.Contains(ctx.Response.Body(), []byte("fs.go")) {
+				t.Fatalf("unexpected body %q. Expecting to contain %q", ctx.Response.Body(), "fs.go")
+			}
+		}
+	})
+}
+
+func TestFSRootEnforcement(t *testing.T) {
+	t.Parallel()
+
+	memFS := fstest.MapFS{
+		"public/index.html":  {Data: []byte("<h1>Public</h1>")},
+		"secret/admin.json":  {Data: []byte(`{"admin": true, "key": "s3cret"}`)},
+		"public/nested/info": {Data: []byte("nested")},
+	}
+
+	// Skip dirfs subtests on Windows: the FS handler pools open file handles
+	// (via bigFileReader) which prevents t.TempDir cleanup.
+	// The mapfs subtests exercise the same root enforcement logic.
+	var tmpDir string
+	if runtime.GOOS != "windows" {
+		tmpDir = t.TempDir()
+		if err := os.MkdirAll(filepath.Join(tmpDir, "public"), 0o755); err != nil {
+			t.Fatalf("cannot create public dir: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "secret"), 0o755); err != nil {
+			t.Fatalf("cannot create secret dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "public", "index.html"), []byte("<h1>Public</h1>"), 0o644); err != nil {
+			t.Fatalf("cannot create public index: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "secret", "admin.json"), []byte(`{"admin": true, "key": "s3cret"}`), 0o644); err != nil {
+			t.Fatalf("cannot create secret admin file: %v", err)
+		}
+	}
+
+	type testCase struct {
+		name        string
+		root        string
+		filesystem  fs.FS
+		pathRewrite PathRewriteFunc
+	}
+
+	cases := make([]testCase, 0, 9)
+	for _, root := range []string{"public", "public/", "./public", "/public"} {
+		cases = append(cases, testCase{
+			name:       "mapfs/" + root,
+			root:       root,
+			filesystem: memFS,
+		})
+		if tmpDir != "" {
+			cases = append(cases, testCase{
+				name:       "dirfs/" + root,
+				root:       root,
+				filesystem: os.DirFS(tmpDir),
+			})
+		}
+	}
+
+	cases = append(cases, testCase{
+		name:       "mapfs/pathrewrite-no-leading-slash",
+		root:       "./public/",
+		filesystem: memFS,
+		pathRewrite: func(ctx *RequestCtx) []byte {
+			return bytes.TrimPrefix(ctx.Path(), []byte("/"))
+		},
+	})
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := make(chan struct{})
+			defer close(stop)
+
+			fs := &FS{
+				Root:           tc.root,
+				FS:             tc.filesystem,
+				AllowEmptyRoot: true,
+				CleanStop:      stop,
+				PathRewrite:    tc.pathRewrite,
+			}
+			h := fs.NewRequestHandler()
+
+			var ctx RequestCtx
+			ctx.Init(&Request{}, nil, TestLogger{t: t})
+
+			checkStatus := func(uri string, expected int) {
+				ctx.Request.Reset()
+				ctx.Response.Reset()
+				ctx.Request.SetRequestURI(uri)
+				h(&ctx)
+				if ctx.Response.StatusCode() != expected {
+					t.Fatalf("unexpected status code for %s: %d. Expecting %d", uri, ctx.Response.StatusCode(), expected)
+				}
+			}
+
+			checkStatus("http://localhost/index.html", StatusOK)
+			checkStatus("http://localhost/secret/admin.json", StatusNotFound)
+		})
+	}
+}
+
+func TestHasDotDotPathSegment(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		path     string
+		expected bool
+	}{
+		{path: "", expected: false},
+		{path: ".", expected: false},
+		{path: "..", expected: true},
+		{path: "../secret.txt", expected: true},
+		{path: "/../secret.txt", expected: true},
+		{path: "nested/../info", expected: true},
+		{path: "nested/..", expected: true},
+		{path: "nested/..hidden/info", expected: false},
+		{path: "nested..", expected: false},
+		{path: "/index.html", expected: false},
+	}
+
+	if filepath.Separator == '\\' {
+		testCases = append(testCases,
+			struct {
+				path     string
+				expected bool
+			}{path: `..\secret.txt`, expected: true},
+			struct {
+				path     string
+				expected bool
+			}{path: `nested\..\info`, expected: true},
+		)
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+
+			if got := hasDotDotPathSegment([]byte(tc.path)); got != tc.expected {
+				t.Fatalf("unexpected result for %q: got %v expected %v", tc.path, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestFSPathRewriteRejectsDotDotSegments(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	publicDir := filepath.Join(tmpDir, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("cannot create public dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicDir, "index.html"), []byte("<h1>Public</h1>"), 0o644); err != nil {
+		t.Fatalf("cannot create public index: %v", err)
+	}
+	secretPath := filepath.Join(tmpDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("TOP_SECRET"), 0o644); err != nil {
+		t.Fatalf("cannot create secret file: %v", err)
+	}
+
+	type testCase struct {
+		name        string
+		pathRewrite PathRewriteFunc
+		requestURI  string
+	}
+
+	testCases := []testCase{
+		{
+			name:        "prefix-stripper-leading-dotdot",
+			pathRewrite: NewPathPrefixStripper(len("/static/")),
+			requestURI:  "http://localhost/aaaaaaa../secret.txt",
+		},
+		{
+			name: "custom-leading-dotdot",
+			pathRewrite: func(ctx *RequestCtx) []byte {
+				return []byte("../secret.txt")
+			},
+			requestURI: "http://localhost/ignored",
+		},
+		{
+			name: "custom-trailing-dotdot",
+			pathRewrite: func(ctx *RequestCtx) []byte {
+				return []byte("nested/..")
+			},
+			requestURI: "http://localhost/ignored",
+		},
+		{
+			name: "custom-exact-dotdot",
+			pathRewrite: func(ctx *RequestCtx) []byte {
+				return []byte("..")
+			},
+			requestURI: "http://localhost/ignored",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := make(chan struct{})
+			defer close(stop)
+
+			fs := &FS{
+				Root:           publicDir,
+				AllowEmptyRoot: true,
+				CleanStop:      stop,
+				PathRewrite:    tc.pathRewrite,
+			}
+			h := fs.NewRequestHandler()
+
+			var ctx RequestCtx
+			ctx.Init(&Request{}, nil, TestLogger{t: t})
+			ctx.Request.SetRequestURI(tc.requestURI)
+
+			h(&ctx)
+
+			if ctx.Response.StatusCode() != StatusInternalServerError {
+				t.Fatalf("unexpected status code for %s: %d. Expecting %d", tc.name, ctx.Response.StatusCode(), StatusInternalServerError)
+			}
+			if bytes.Contains(ctx.Response.Body(), []byte("TOP_SECRET")) {
+				t.Fatalf("unexpected secret disclosure for %s", tc.name)
+			}
+		})
+	}
+}
+
+// On Windows a '\' also separates path components. ctx.Path()'s normalization
+// rewrites some backslash '..' sequences (`\..\`, `/..\`), but a `\../` segment
+// survives it, so without the guard filepath.FromSlash later turns it into a
+// real parent-directory jump outside Root.
+// See https://github.com/valyala/fasthttp/issues/1691.
+func TestFSServeRejectsBackslashDotDotSegments(t *testing.T) {
+	if filepath.Separator != '\\' {
+		t.Skip("backslash path separator is Windows only")
+	}
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	publicDir := filepath.Join(tmpDir, "public")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("cannot create public dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicDir, "index.html"), []byte("<h1>Public</h1>"), 0o644); err != nil {
+		t.Fatalf("cannot create public index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "secret.txt"), []byte("TOP_SECRET"), 0o644); err != nil {
+		t.Fatalf("cannot create secret file: %v", err)
+	}
+
+	requestURIs := []string{
+		`http://localhost/\../secret.txt`,
+		`http://localhost/\../\../secret.txt`,
+		`http://localhost/public/\../\../secret.txt`,
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	fs := &FS{
+		Root:      publicDir,
+		CleanStop: stop,
+	}
+	h := fs.NewRequestHandler()
+
+	for _, uri := range requestURIs {
+		t.Run(uri, func(t *testing.T) {
+			var ctx RequestCtx
+			ctx.Init(&Request{}, nil, TestLogger{t: t})
+			ctx.Request.SetRequestURI(uri)
+
+			h(&ctx)
+
+			if ctx.Response.StatusCode() != StatusInternalServerError {
+				t.Fatalf("unexpected status code for %q: %d. Expecting %d", uri, ctx.Response.StatusCode(), StatusInternalServerError)
+			}
+			if bytes.Contains(ctx.Response.Body(), []byte("TOP_SECRET")) {
+				t.Fatalf("unexpected secret disclosure for %q", uri)
+			}
+		})
+	}
+}
+
+func TestFSGenerateETagFS(t *testing.T) {
+	t.Parallel()
+
+	mtime := time.Unix(1700000000, 0)
+	testFS := fstest.MapFS{
+		"file.txt":     {Data: []byte("body"), ModTime: mtime},
+		"no-mtime.txt": {Data: []byte("body")},
+	}
+	h := (&FS{FS: testFS, AllowEmptyRoot: true, GenerateETag: true, SkipCache: true}).NewRequestHandler()
+
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, TestLogger{t})
+	ctx.Request.SetRequestURI("/file.txt")
+	h(&ctx)
+	expectedETag := `W/"6553f100-4"`
+	if etag := string(ctx.Response.Header.Peek(HeaderETag)); etag != expectedETag {
+		t.Fatalf("unexpected ETag: %q. Expecting %q", etag, expectedETag)
+	}
+
+	// A size-only tag can't detect changes, so no ETag is sent without a modification time.
+	ctx.Request.Reset()
+	ctx.Response.Reset()
+	ctx.Request.SetRequestURI("/no-mtime.txt")
+	h(&ctx)
+	if ctx.Response.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", ctx.Response.StatusCode(), StatusOK)
+	}
+	if etag := ctx.Response.Header.Peek(HeaderETag); len(etag) > 0 {
+		t.Fatalf("unexpected ETag: %q", etag)
+	}
+}
+
+func TestFSFSUnknownModTime(t *testing.T) {
+	t.Parallel()
+
+	// A filesystem without modification times reports the zero time for every
+	// file, embed.FS among them. That is no date to send as Last-Modified or
+	// to compare a validator against: it stays the same when the file changes.
+	const body = "body"
+	testFS := fstest.MapFS{
+		"zero.txt":  {Data: []byte(body)},
+		"epoch.txt": {Data: []byte(body), ModTime: time.Unix(0, 0)},
+	}
+	zeroDate := string(AppendHTTPDate(nil, time.Time{}))
+	now := string(AppendHTTPDate(nil, time.Now()))
+
+	tests := []struct {
+		name   string
+		fsys   fs.FS
+		path   string
+		header string
+		value  string
+	}{
+		{name: "no validator", fsys: testFS, path: "/zero.txt"},
+		{name: "If-Modified-Since", fsys: testFS, path: "/zero.txt", header: HeaderIfModifiedSince, value: now},
+		{name: "If-Modified-Since with the zero time", fsys: testFS, path: "/zero.txt", header: HeaderIfModifiedSince, value: zeroDate},
+		{name: "If-Range with the zero time", fsys: testFS, path: "/zero.txt", header: HeaderIfRange, value: zeroDate},
+		{name: "Unix epoch", fsys: testFS, path: "/epoch.txt", header: HeaderIfModifiedSince, value: now},
+		{name: "embed.FS", fsys: fsTestFilesystem, path: "/fs.go", header: HeaderIfModifiedSince, value: now},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := (&FS{FS: tt.fsys, AllowEmptyRoot: true, AcceptByteRange: true}).NewRequestHandler()
+
+			var ctx RequestCtx
+			ctx.Init(&Request{}, nil, TestLogger{t})
+			ctx.Request.SetRequestURI(tt.path)
+			if tt.header != "" {
+				ctx.Request.Header.Set(tt.header, tt.value)
+			}
+			if tt.header == HeaderIfRange {
+				ctx.Request.Header.Set(HeaderRange, "bytes=0-1")
+			}
+			h(&ctx)
+
+			resp := readResponseFromCtx(t, &ctx, false)
+			if resp.StatusCode() != StatusOK {
+				t.Fatalf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusOK)
+			}
+			if len(resp.Body()) == 0 {
+				t.Fatal("unexpected empty body")
+			}
+			if lastModified := resp.Header.Peek(HeaderLastModified); len(lastModified) > 0 {
+				t.Fatalf("unexpected Last-Modified: %q", lastModified)
+			}
+		})
+	}
+}
+
+func TestFSFSOldModTime(t *testing.T) {
+	t.Parallel()
+
+	// Only the zero time and the Unix epoch itself mean an unknown
+	// modification time. Earlier times and times within the first second
+	// after the epoch are valid dates to send and to revalidate against.
+	tests := []struct {
+		modTime time.Time
+		name    string
+	}{
+		{name: "before the Unix epoch", modTime: time.Date(1969, time.July, 20, 20, 17, 40, 0, time.UTC)},
+		{name: "half a second after the Unix epoch", modTime: time.Unix(0, int64(time.Second/2))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			testFS := fstest.MapFS{"file.txt": {Data: []byte("body"), ModTime: tt.modTime}}
+			h := (&FS{FS: testFS, AllowEmptyRoot: true}).NewRequestHandler()
+
+			var ctx RequestCtx
+			ctx.Init(&Request{}, nil, TestLogger{t})
+			ctx.Request.SetRequestURI("/file.txt")
+			h(&ctx)
+
+			resp := readResponseFromCtx(t, &ctx, false)
+			if resp.StatusCode() != StatusOK {
+				t.Fatalf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusOK)
+			}
+			lastModified := string(resp.Header.Peek(HeaderLastModified))
+			if want := string(AppendHTTPDate(nil, tt.modTime)); lastModified != want {
+				t.Fatalf("unexpected Last-Modified %q. Expecting %q", lastModified, want)
+			}
+
+			ctx.Init(&Request{}, nil, TestLogger{t})
+			ctx.Request.SetRequestURI("/file.txt")
+			ctx.Request.Header.Set(HeaderIfModifiedSince, lastModified)
+			h(&ctx)
+
+			resp = readResponseFromCtx(t, &ctx, true)
+			if resp.StatusCode() != StatusNotModified {
+				t.Fatalf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusNotModified)
+			}
+		})
+	}
+}
+
+func TestFSFSSmallFileServedFromMemory(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("small file body")
+	testFS := fstest.MapFS{
+		"file.txt": {Data: body},
+	}
+
+	tests := []struct {
+		name          string
+		fsys          fs.FS
+		inMemory      bool
+		contentLength int
+	}{
+		{name: "read at", fsys: testFS, inMemory: true, contentLength: len(body)},
+		// Stat reports more bytes than the file holds, as it does for a file
+		// that shrank since.
+		{name: "shrunk", fsys: fileWrapFS{FS: testFS, extraSize: 1}, inMemory: true, contentLength: len(body)},
+		// Without ReadAt the file keeps being read on every request.
+		{name: "no read at", fsys: fileWrapFS{FS: testFS}, inMemory: false, contentLength: len(body)},
+		// Size is only a byte count for regular files, other files may
+		// report a negative one. Those keep being streamed, chunked.
+		{name: "negative size", fsys: fileWrapFS{FS: testFS, extraSize: -int64(len(body)) - 1}, inMemory: false, contentLength: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := (&FS{FS: tt.fsys, AllowEmptyRoot: true}).NewRequestHandler()
+			for range 2 {
+				var ctx RequestCtx
+				ctx.Init(&Request{}, nil, TestLogger{t})
+				ctx.Request.SetRequestURI("/file.txt")
+				h(&ctx)
+
+				_, inMemory := ctx.Response.bodyStream.(*fsSmallFileReader)
+				if inMemory != tt.inMemory {
+					t.Fatalf("unexpected body stream %T", ctx.Response.bodyStream)
+				}
+				resp := readResponseFromCtx(t, &ctx, false)
+				if resp.StatusCode() != StatusOK {
+					t.Fatalf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusOK)
+				}
+				if resp.Header.ContentLength() != tt.contentLength || !bytes.Equal(resp.Body(), body) {
+					t.Fatalf("unexpected response with Content-Length %d and body %q. Expecting %d and %q",
+						resp.Header.ContentLength(), resp.Body(), tt.contentLength, body)
+				}
+			}
+		})
+	}
+}
+
+// fileWrapFS hands out files without a ReadAt method, or, if extraSize is
+// set, files whose Stat reports a size extraSize off from what they hold.
+type fileWrapFS struct {
+	fs.FS
+
+	extraSize int64
+}
+
+func (fsys fileWrapFS) Open(name string) (fs.File, error) {
+	f, err := fsys.FS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if fsys.extraSize != 0 {
+		return resizedFile{seekFile: seekFile{f}, extraSize: fsys.extraSize}, nil
+	}
+	return seekFile{f}, nil
+}
+
+// seekFile keeps the Seek method the file readers need and hides ReadAt.
+type seekFile struct {
+	fs.File
+}
+
+func (f seekFile) Seek(offset int64, whence int) (int64, error) {
+	return f.File.(io.Seeker).Seek(offset, whence) //nolint:forcetypeassert
+}
+
+type resizedFile struct {
+	seekFile
+
+	extraSize int64
+}
+
+func (f resizedFile) ReadAt(p []byte, off int64) (int, error) {
+	return f.File.(io.ReaderAt).ReadAt(p, off) //nolint:forcetypeassert
+}
+
+func (f resizedFile) Stat() (fs.FileInfo, error) {
+	fi, err := f.File.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return resizedFileInfo{FileInfo: fi, extraSize: f.extraSize}, nil
+}
+
+type resizedFileInfo struct {
+	fs.FileInfo
+
+	extraSize int64
+}
+
+func (fi resizedFileInfo) Size() int64 {
+	return fi.FileInfo.Size() + fi.extraSize
+}
+
+func TestFSSmallFilesInMemoryLimit(t *testing.T) {
+	t.Parallel()
+
+	// On a case-insensitive filesystem one file answers to as many cached
+	// paths as its name has letter case variants.
+	const name = "abcdefghijklm.txt"
+	body := []byte("body")
+	fsys := caseInsensitiveFS{fsys: fstest.MapFS{name: {Data: body}}}
+	stop := make(chan struct{})
+	defer close(stop)
+	h := (&FS{FS: fsys, AllowEmptyRoot: true, CleanStop: stop}).NewRequestHandler()
+
+	inMemory := 0
+	for i := range maxSmallFilesInMemory + 100 {
+		path := []byte("/" + name)
+		for j := range 13 {
+			if i&(1<<j) != 0 {
+				path[1+j] -= 'a' - 'A'
+			}
+		}
+		var ctx RequestCtx
+		ctx.Init(&Request{}, nil, TestLogger{t})
+		ctx.Request.SetRequestURIBytes(path)
+		h(&ctx)
+		if _, ok := ctx.Response.bodyStream.(*fsSmallFileReader); ok {
+			inMemory++
+		}
+		if ctx.Response.StatusCode() != StatusOK || !bytes.Equal(ctx.Response.Body(), body) {
+			t.Fatalf("unexpected response for %q: status %d, body %q", path, ctx.Response.StatusCode(), ctx.Response.Body())
+		}
+	}
+	if inMemory != maxSmallFilesInMemory {
+		t.Fatalf("%d files kept in memory. Expecting %d", inMemory, maxSmallFilesInMemory)
+	}
+}
+
+func TestFSSmallFilesInMemoryReleased(t *testing.T) {
+	t.Parallel()
+
+	testFS := fstest.MapFS{"file.txt": {Data: []byte("body")}}
+	h := &fsHandler{filesystem: testFS}
+	open := func() *fsFile {
+		t.Helper()
+		f, err := testFS.Open("file.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ff, err := h.newFSFile(f, fi, false, "file.txt", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ff
+	}
+
+	ff := open()
+	if ff.f != nil || h.smallFilesInMemory.Load() != 1 {
+		t.Fatalf("small file not counted in memory: descriptor open %t, count %d", ff.f != nil, h.smallFilesInMemory.Load())
+	}
+	ff.Release()
+	if n := h.smallFilesInMemory.Load(); n != 0 {
+		t.Fatalf("unexpected count %d after release. Expecting 0", n)
+	}
+
+	// Past the limit a small file stays open, and releasing it leaves the
+	// count alone.
+	h.smallFilesInMemory.Store(maxSmallFilesInMemory)
+	ff = open()
+	if ff.f == nil {
+		t.Fatal("small file kept in memory past the limit")
+	}
+	ff.Release()
+	if n := h.smallFilesInMemory.Load(); n != maxSmallFilesInMemory {
+		t.Fatalf("unexpected count %d after release. Expecting %d", n, maxSmallFilesInMemory)
+	}
+}
+
+// caseInsensitiveFS opens names regardless of their letter case, as the
+// default filesystems on Windows and macOS do.
+type caseInsensitiveFS struct {
+	fsys fs.FS
+}
+
+func (c caseInsensitiveFS) Open(name string) (fs.File, error) {
+	return c.fsys.Open(strings.ToLower(name))
+}
+
+// A stale compressed file in a custom fs.FS is compressed again in memory.
+// Nothing may be removed from the OS filesystem, where the same relative
+// name refers to an unrelated file.
+func TestFSFSStaleCompressedFileNotRemovedFromDisk(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const cachedName = "page.html.fasthttp.gz"
+	if err := os.WriteFile(cachedName, []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	content := bytes.Repeat([]byte("compressible-data-"), 1000)
+	testFS := fstest.MapFS{
+		"page.html": {Data: content, ModTime: now},
+		cachedName:  {Data: AppendGzipBytes(nil, []byte("stale")), ModTime: now.Add(-time.Hour)},
+	}
+	h := (&FS{FS: testFS, Compress: true, SkipCache: true}).NewRequestHandler()
+
+	var ctx RequestCtx
+	ctx.Init(&Request{}, nil, nil)
+	ctx.Request.SetRequestURI("/page.html")
+	ctx.Request.Header.Set(HeaderAcceptEncoding, "gzip")
+	h(&ctx)
+
+	status, encoding := ctx.Response.StatusCode(), string(ctx.Response.Header.ContentEncoding())
+	if status != StatusOK || encoding != "gzip" {
+		t.Fatalf("status=%d encoding=%q, want %d gzip", status, encoding, StatusOK)
+	}
+	body, err := AppendGunzipBytes(nil, ctx.Response.Body())
+	if err != nil || !bytes.Equal(body, content) {
+		t.Fatalf("served %q (%v), want the file compressed again", body, err)
+	}
+	if _, err := os.Stat(cachedName); err != nil {
+		t.Fatalf("file %q in the working directory was removed: %v", cachedName, err)
+	}
+}

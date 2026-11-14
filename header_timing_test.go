@@ -3,14 +3,20 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
+	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/valyala/bytebufferpool"
 )
 
 var strFoobar = []byte("foobar.com")
+
+// it has the same length as Content-Type.
+var strNonSpecialHeader = []byte("Dontent-Type")
 
 type benchReadBuf struct {
 	s []byte
@@ -31,14 +37,56 @@ func BenchmarkRequestHeaderRead(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		var h RequestHeader
 		buf := &benchReadBuf{
-			s: []byte("GET /foo/bar HTTP/1.1\r\nHost: foobar.com\r\nUser-Agent: aaa.bbb\r\nReferer: http://google.com/aaa/bbb\r\n\r\n"),
+			s: []byte(
+				"GET /foo/bar HTTP/1.1\r\n" +
+					"Host: foobar.com\r\n" +
+					"User-Agent: aaa.bbb\r\n" +
+					"Referer: http://google.com/aaa/bbb\r\n" +
+					"Content-Type: text/html\r\n" +
+					"Server: aaa 1/2.3\r\n" +
+					"Test: 1.2.3\r\n" +
+					"Foo: bar\r\n" +
+					"X-Forwarded-For: 1.2.3.4\r\n" +
+					"X-Forwarded-Proto: https\r\n" +
+					"\r\n",
+			),
 		}
 		br := bufio.NewReader(buf)
 		for pb.Next() {
 			buf.n = 0
 			br.Reset(buf)
+			h.Reset()
 			if err := h.Read(br); err != nil {
-				b.Fatalf("unexpected error when reading header: %s", err)
+				b.Fatalf("unexpected error when reading header: %v", err)
+			}
+		}
+	})
+}
+
+// Benchmark net/http as a comparison.
+func BenchmarkRequestHeaderReadNetHttp(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		buf := &benchReadBuf{
+			s: []byte(
+				"GET /foo/bar HTTP/1.1\r\n" +
+					"Host: foobar.com\r\n" +
+					"User-Agent: aaa.bbb\r\n" +
+					"Referer: http://google.com/aaa/bbb\r\n" +
+					"Content-Type: text/html\r\n" +
+					"Test: 1.2.3\r\n" +
+					"Foo: bar\r\n" +
+					"X-Forwarded-For: 1.2.3.4\r\n" +
+					"X-Forwarded-Proto: https\r\n" +
+					"\r\n",
+			),
+		}
+		br := bufio.NewReader(buf)
+		for pb.Next() {
+			buf.n = 0
+			br.Reset(buf)
+
+			if _, err := http.ReadRequest(br); err != nil {
+				b.Fatalf("unexpected error when reading header: %v", err)
 			}
 		}
 	})
@@ -48,14 +96,25 @@ func BenchmarkResponseHeaderRead(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		var h ResponseHeader
 		buf := &benchReadBuf{
-			s: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1256\r\nServer: aaa 1/2.3\r\nTest: 1.2.3\r\n\r\n"),
+			s: []byte(
+				"HTTP/1.1 200 OK\r\n" +
+					"Content-Type: text/html\r\n" +
+					"Server: aaa 1/2.3\r\n" +
+					"Test: 1.2.3\r\n" +
+					"Foo: bar\r\n" +
+					"Content-Length: 1256\r\n" +
+					"Content-Encoding: gzip\r\n" +
+					"Cache-Control: no-cache\r\n" +
+					"\r\n",
+			),
 		}
 		br := bufio.NewReader(buf)
 		for pb.Next() {
 			buf.n = 0
 			br.Reset(buf)
+			h.Reset()
 			if err := h.Read(br); err != nil {
-				b.Fatalf("unexpected error when reading header: %s", err)
+				b.Fatalf("unexpected error when reading header: %v", err)
 			}
 		}
 	})
@@ -71,7 +130,7 @@ func BenchmarkRequestHeaderWrite(b *testing.B) {
 		var w bytebufferpool.ByteBuffer
 		for pb.Next() {
 			if _, err := h.WriteTo(&w); err != nil {
-				b.Fatalf("unexpected error when writing header: %s", err)
+				b.Fatalf("unexpected error when writing header: %v", err)
 			}
 			w.Reset()
 		}
@@ -89,19 +148,20 @@ func BenchmarkResponseHeaderWrite(b *testing.B) {
 		var w bytebufferpool.ByteBuffer
 		for pb.Next() {
 			if _, err := h.WriteTo(&w); err != nil {
-				b.Fatalf("unexpected error when writing header: %s", err)
+				b.Fatalf("unexpected error when writing header: %v", err)
 			}
 			w.Reset()
 		}
 	})
 }
 
-func BenchmarkRequestHeaderPeekBytesCanonical(b *testing.B) {
+// Result: 2.2 ns/op.
+func BenchmarkRequestHeaderPeekBytesSpecialHeader(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		var h RequestHeader
-		h.SetBytesV("Host", strFoobar)
+		h.SetContentTypeBytes(strFoobar)
 		for pb.Next() {
-			v := h.PeekBytes(strHost)
+			v := h.PeekBytes(strContentType)
 			if !bytes.Equal(v, strFoobar) {
 				b.Fatalf("unexpected result: %q. Expected %q", v, strFoobar)
 			}
@@ -109,13 +169,41 @@ func BenchmarkRequestHeaderPeekBytesCanonical(b *testing.B) {
 	})
 }
 
-func BenchmarkRequestHeaderPeekBytesNonCanonical(b *testing.B) {
+// Result: 2.9 ns/op.
+func BenchmarkRequestHeaderPeekBytesNonSpecialHeader(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		var h RequestHeader
-		h.SetBytesV("Host", strFoobar)
-		hostBytes := []byte("HOST")
+		h.SetBytesKV(strNonSpecialHeader, strFoobar)
 		for pb.Next() {
-			v := h.PeekBytes(hostBytes)
+			v := h.PeekBytes(strNonSpecialHeader)
+			if !bytes.Equal(v, strFoobar) {
+				b.Fatalf("unexpected result: %q. Expected %q", v, strFoobar)
+			}
+		}
+	})
+}
+
+// Result: 2.3 ns/op.
+func BenchmarkResponseHeaderPeekBytesSpecialHeader(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		var h ResponseHeader
+		h.SetContentTypeBytes(strFoobar)
+		for pb.Next() {
+			v := h.PeekBytes(strContentType)
+			if !bytes.Equal(v, strFoobar) {
+				b.Fatalf("unexpected result: %q. Expected %q", v, strFoobar)
+			}
+		}
+	})
+}
+
+// Result: 2.9 ns/op.
+func BenchmarkResponseHeaderPeekBytesNonSpecialHeader(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		var h ResponseHeader
+		h.SetBytesKV(strNonSpecialHeader, strFoobar)
+		for pb.Next() {
+			v := h.PeekBytes(strNonSpecialHeader)
 			if !bytes.Equal(v, strFoobar) {
 				b.Fatalf("unexpected result: %q. Expected %q", v, strFoobar)
 			}
@@ -148,17 +236,32 @@ func benchmarkNormalizeHeaderKey(b *testing.B, src []byte) {
 	})
 }
 
+func BenchmarkVisitHeaderParams(b *testing.B) {
+	var h RequestHeader
+	h.SetBytesKV(strContentType, []byte(`text/plain  ;  foo=bar  ;   param2="dquote is: [\"], ok?" ; version=1; q=0.324  `))
+
+	header := h.ContentType()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		VisitHeaderParams(header, func(key, value []byte) bool { return true })
+	}
+}
+
 func BenchmarkRemoveNewLines(b *testing.B) {
 	type testcase struct {
 		value         string
 		expectedValue string
 	}
 
-	var testcases = []testcase{
+	testcases := []testcase{
 		{value: "MaliciousValue", expectedValue: "MaliciousValue"},
 		{value: "MaliciousValue\r\n", expectedValue: "MaliciousValue  "},
 		{value: "Malicious\nValue", expectedValue: "Malicious Value"},
 		{value: "Malicious\rValue", expectedValue: "Malicious Value"},
+		{value: strings.Repeat("LongValue", 12), expectedValue: strings.Repeat("LongValue", 12)},
+		{value: strings.Repeat("LongValue", 12) + "\r\n", expectedValue: strings.Repeat("LongValue", 12) + "  "},
 	}
 
 	for i, tcase := range testcases {
@@ -176,5 +279,99 @@ func BenchmarkRemoveNewLines(b *testing.B) {
 				subB.Errorf("unexpected value, got: %+v", actualValue)
 			}
 		})
+	}
+}
+
+func BenchmarkRequestHeaderIsGet(b *testing.B) {
+	req := &RequestHeader{method: []byte(MethodGet)}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			req.IsGet()
+		}
+	})
+}
+
+func BenchmarkRequestHeaderReadDrip(b *testing.B) {
+	// One byte per read: every retry must stay cheap until the block is in.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n")
+	for len(wire) < 4096 {
+		wire = append(wire, "X-Header-Name: some ordinary header value here\r\n"...)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &dripTestReader{data: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.pos = 0
+		br.Reset(dr)
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestHeaderReadTrailerAnnouncement(b *testing.B) {
+	// A Trailer field full of distinct names: recording the set must not
+	// cost a scan of every name already in it.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\nTrailer: X-T0")
+	for i := 1; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, ",X-T%d", i)
+	}
+	wire = append(wire, "\r\n\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		h.Reset()
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestReadTrailerSection(b *testing.B) {
+	// The same set, arriving as the trailer section of a chunked body.
+	wire := []byte("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+	for i := 0; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, "X-T%d: v\r\n", i)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var req Request
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		req.Reset()
+		if err := req.ReadLimitBody(br, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestHeaderReadTrailerAnnouncementFields(b *testing.B) {
+	// The same set split over one Trailer field per name: the index has to
+	// survive the whole header parse, or every field rebuilds it.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n")
+	for i := 0; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, "Trailer: X-T%d\r\n", i)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		h.Reset()
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -4,17 +4,243 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
+func TestResponseHeaderAddContentType(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	h.Add("Content-Type", "test")
+
+	got := string(h.Peek("Content-Type"))
+	expected := "test"
+	if got != expected {
+		t.Errorf("expected %q got %q", expected, got)
+	}
+
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		t.Fatalf("unexpected error when writing header: %v", err)
+	}
+
+	if n := strings.Count(buf.String(), "Content-Type: "); n != 1 {
+		t.Errorf("Content-Type occurred %d times", n)
+	}
+}
+
+func TestResponseHeaderAddContentEncoding(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	h.Add("Content-Encoding", "test")
+
+	got := string(h.Peek("Content-Encoding"))
+	expected := "test"
+	if got != expected {
+		t.Errorf("expected %q got %q", expected, got)
+	}
+
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		t.Fatalf("unexpected error when writing header: %v", err)
+	}
+
+	if n := strings.Count(buf.String(), "Content-Encoding: "); n != 1 {
+		t.Errorf("Content-Encoding occurred %d times", n)
+	}
+}
+
+func TestResponseHeaderFirstLineSettersSanitizeNewlines(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name              string
+		set               func(*ResponseHeader)
+		value             func(*ResponseHeader) []byte
+		expectedValue     string
+		expectedFirstLine string
+	}{
+		{
+			name: "set status message",
+			set: func(h *ResponseHeader) {
+				h.SetStatusMessage([]byte("OK\r\nInjected-Status: true"))
+			},
+			value:             func(h *ResponseHeader) []byte { return h.StatusMessage() },
+			expectedValue:     "OK  Injected-Status: true",
+			expectedFirstLine: "HTTP/1.1 200 OK  Injected-Status: true",
+		},
+		{
+			name: "set protocol",
+			set: func(h *ResponseHeader) {
+				h.SetProtocol([]byte("HTTP/1.1\r\nInjected-Protocol: true"))
+			},
+			value:             func(h *ResponseHeader) []byte { return h.Protocol() },
+			expectedValue:     "HTTP/1.1  Injected-Protocol: true",
+			expectedFirstLine: "HTTP/1.1  Injected-Protocol: true 200 OK",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h ResponseHeader
+			h.SetStatusCode(StatusOK)
+			h.SetStatusMessage([]byte("OK"))
+
+			tc.set(&h)
+
+			if got := string(tc.value(&h)); got != tc.expectedValue {
+				t.Fatalf("unexpected sanitized value: %q. Expected %q", got, tc.expectedValue)
+			}
+
+			firstLine, _, ok := bytes.Cut(h.Header(), strCRLF)
+			if !ok {
+				t.Fatalf("missing response first line terminator in header %q", h.Header())
+			}
+			if got := string(firstLine); got != tc.expectedFirstLine {
+				t.Fatalf("unexpected response first line: %q. Expected %q", got, tc.expectedFirstLine)
+			}
+			if bytes.Contains(h.Header(), []byte("\r\nInjected-")) {
+				t.Fatalf("unexpected injected header line in %q", h.Header())
+			}
+		})
+	}
+}
+
+func TestResponseHeaderKeySettersSanitizeNewlines(t *testing.T) {
+	t.Parallel()
+
+	const badKey = "X-Foo\r\nInjected: true"
+
+	testCases := []struct {
+		name string
+		set  func(*ResponseHeader)
+	}{
+		{name: "set", set: func(h *ResponseHeader) { h.Set(badKey, "bar") }},
+		{name: "add", set: func(h *ResponseHeader) { h.Add(badKey, "bar") }},
+		{name: "set bytes v", set: func(h *ResponseHeader) { h.SetBytesV(badKey, []byte("bar")) }},
+		{name: "set bytes kv", set: func(h *ResponseHeader) { h.SetBytesKV([]byte(badKey), []byte("bar")) }},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h ResponseHeader
+			h.SetStatusCode(StatusOK)
+			h.SetContentLength(0)
+			tc.set(&h)
+
+			if bytes.Contains(h.Header(), []byte("\r\nInjected:")) {
+				t.Fatalf("header key injection reached the wire in %q", h.Header())
+			}
+		})
+	}
+}
+
+func TestRequestHeaderKeySettersSanitizeNewlines(t *testing.T) {
+	t.Parallel()
+
+	const badKey = "X-Foo\r\nInjected: true"
+
+	testCases := []struct {
+		name string
+		set  func(*RequestHeader)
+	}{
+		{name: "set", set: func(h *RequestHeader) { h.Set(badKey, "bar") }},
+		{name: "add", set: func(h *RequestHeader) { h.Add(badKey, "bar") }},
+		{name: "set bytes v", set: func(h *RequestHeader) { h.SetBytesV(badKey, []byte("bar")) }},
+		{name: "set bytes kv", set: func(h *RequestHeader) { h.SetBytesKV([]byte(badKey), []byte("bar")) }},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h RequestHeader
+			h.SetMethod(MethodGet)
+			h.SetRequestURI("/")
+			h.SetHost("example.com")
+			tc.set(&h)
+
+			if bytes.Contains(h.Header(), []byte("\r\nInjected:")) {
+				t.Fatalf("header key injection reached the wire in %q", h.Header())
+			}
+		})
+	}
+}
+
+func TestRemoveNewLines(t *testing.T) {
+	t.Parallel()
+
+	// Lengths on both sides of the switch to bytes.IndexByte, with a CR or
+	// LF, or another control byte the word check stops at, in every
+	// position, and a CR at the end that the check must still reach.
+	for n := range 80 {
+		for pos := range n {
+			for _, c := range []byte{'\r', '\n', '\t', 0, 0x7f} {
+				src := bytes.Repeat([]byte{'a'}, n)
+				src[n-1] = '\r'
+				src[pos] = c
+				want := bytes.Clone(src)
+				for i, c := range want {
+					if c == '\r' || c == '\n' {
+						want[i] = ' '
+					}
+				}
+				if got := removeNewLines(bytes.Clone(src)); !bytes.Equal(got, want) {
+					t.Fatalf("removeNewLines(%q) = %q, want %q", src, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestNormalizeHeaderKey(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		key        string
+		normalized string
+		raw        string
+	}{
+		{key: "", normalized: "", raw: ""},
+		{key: "content-TYPE", normalized: "Content-Type", raw: "content-TYPE"},
+		{key: "-x--forwarded-", normalized: "-X--Forwarded-", raw: "-x--forwarded-"},
+		// An invalid key is not normalized, but its CR and LF are neutralised.
+		{key: "x foo", normalized: "x foo", raw: "x foo"},
+		{key: "x-foo\r\nInjected: yes", normalized: "x-foo  Injected: yes", raw: "x-foo  Injected: yes"},
+		{key: "x\n", normalized: "x ", raw: "x "},
+	}
+	for _, tc := range testCases {
+		for _, disableNormalizing := range []bool{false, true} {
+			want := tc.normalized
+			if disableNormalizing {
+				want = tc.raw
+			}
+			b := []byte(tc.key)
+			normalizeHeaderKey(b, disableNormalizing)
+			if string(b) != want {
+				t.Fatalf("normalizeHeaderKey(%q, %v) = %q, want %q", tc.key, disableNormalizing, b, want)
+			}
+		}
+	}
+}
+
 func TestResponseHeaderMultiLineValue(t *testing.T) {
-	s := "HTTP/1.1 200 OK\r\n" +
+	t.Parallel()
+
+	s := "HTTP/1.1 200 SuperOK\r\n" +
 		"EmptyValue1:\r\n" +
 		"Content-Type: foo/bar;\r\n\tnewline;\r\n another/newline\r\n" +
 		"Foo: Bar\r\n" +
@@ -23,11 +249,37 @@ func TestResponseHeaderMultiLineValue(t *testing.T) {
 		"\r\n"
 	header := new(ResponseHeader)
 	if _, err := header.parse([]byte(s)); err != nil {
-		t.Fatalf("parse headers with multi-line values failed, %s", err)
+		t.Fatalf("parse headers with multi-line values failed, %v", err)
 	}
 	response, err := http.ReadResponse(bufio.NewReader(strings.NewReader(s)), nil)
 	if err != nil {
-		t.Fatalf("parse response using net/http failed, %s", err)
+		t.Fatalf("parse response using net/http failed, %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if !bytes.Equal(header.StatusMessage(), []byte("SuperOK")) {
+		t.Errorf("parse status line with non-default value failed, got: '%q' want: 'SuperOK'", header.StatusMessage())
+	}
+
+	header.SetProtocol([]byte("HTTP/3.3"))
+	if !bytes.Equal(header.Protocol(), []byte("HTTP/3.3")) {
+		t.Errorf("parse protocol with non-default value failed, got: '%q' want: 'HTTP/3.3'", header.Protocol())
+	}
+
+	if !bytes.Equal(header.appendStatusLine(nil), []byte("HTTP/3.3 200 SuperOK\r\n")) {
+		t.Errorf("parse status line with non-default value failed, got: '%q' want: 'HTTP/3.3 200 SuperOK'", header.Protocol())
+	}
+
+	header.SetStatusMessage(nil)
+
+	if !bytes.Equal(header.appendStatusLine(nil), []byte("HTTP/3.3 200 OK\r\n")) {
+		t.Errorf("parse status line with default protocol value failed, got: '%q' want: 'HTTP/3.3 200 OK'", header.appendStatusLine(nil))
+	}
+
+	header.SetStatusMessage(s2b(StatusMessage(200)))
+
+	if !bytes.Equal(header.appendStatusLine(nil), []byte("HTTP/3.3 200 OK\r\n")) {
+		t.Errorf("parse status line with default protocol value failed, got: '%q' want: 'HTTP/3.3 200 OK'", header.appendStatusLine(nil))
 	}
 
 	for name, vals := range response.Header {
@@ -35,32 +287,80 @@ func TestResponseHeaderMultiLineValue(t *testing.T) {
 		want := vals[0]
 
 		if got != want {
-			t.Errorf("unexpected %s got: %q want: %q", name, got, want)
+			t.Errorf("unexpected %q got: %q want: %q", name, got, want)
 		}
 	}
 }
 
-func TestResponseHeaderMultiLineName(t *testing.T) {
-	s := "HTTP/1.1 200 OK\r\n" +
-		"Host: golang.org\r\n" +
-		"Gopher-New-\r\n" +
-		" Line: This is a header on multiple lines\r\n" +
+func TestIssue1808(t *testing.T) {
+	t.Parallel()
+
+	s := "HTTP/1.1 200\r\n" +
+		"WithTabs: \t v1 \t\r\n" + // "v1"
+		"WithTabs-Start: \t \t v1 \r\n" + // "v1"
+		"WithTabs-End: v1 \t \t\t\t\r\n" + // "v1"
+		"WithTabs-Multi-Line: \t v1 \t;\r\n \t v2 \t;\r\n\t v3\r\n" + // "v1 \t; v2 \t; v3"
 		"\r\n"
-	header := new(ResponseHeader)
-	if _, err := header.parse([]byte(s)); err != errInvalidName {
-		m := make(map[string]string)
-		header.VisitAll(func(key, value []byte) {
-			m[string(key)] = string(value)
-		})
-		t.Errorf("expected error, got %q (%v)", m, err)
+
+	resHeader := new(ResponseHeader)
+	if _, err := resHeader.parse([]byte(s)); err != nil {
+		t.Fatalf("parse headers with tabs values failed, %v", err)
+	}
+
+	groundTruth := map[string]string{
+		"WithTabs":            "v1",
+		"WithTabs-Start":      "v1",
+		"WithTabs-End":        "v1",
+		"WithTabs-Multi-Line": "v1 \t; v2 \t; v3",
+	}
+
+	for name, want := range groundTruth {
+		if got := b2s(resHeader.Peek(name)); got != want {
+			t.Errorf("ResponseHeader.parser() unexpected %q got: %q want: %q", name, got, want)
+		}
+	}
+
+	s = "GET / HTTP/1.1\r\n" +
+		"WithTabs: \t v1 \t\r\n" + // "v1"
+		"WithTabs-Start: \t \t v1 \r\n" + // "v1"
+		"WithTabs-End: v1 \t \t\t\t\r\n" + // "v1"
+		"WithTabs-Multi-Line: \t v1 \t;\r\n \t v2 \t;\r\n\t v3\r\n" + // "v1 \t; v2 \t; v3"
+		"\r\n"
+
+	reqHeader := new(RequestHeader)
+	if _, err := reqHeader.parse([]byte(s)); err != nil {
+		t.Fatalf("parse headers with tabs values failed, %v", err)
+	}
+
+	for name, want := range groundTruth {
+		if got := b2s(reqHeader.Peek(name)); got != want {
+			t.Errorf("RequestHeader.parser() unexpected %q got: %q want: %q", name, got, want)
+		}
 	}
 }
 
-func TestResponseHeaderMultiLinePaniced(t *testing.T) {
+func TestResponseHeaderMultiLinePanicked(t *testing.T) {
+	t.Parallel()
+
 	// Input generated by fuzz testing that caused the parser to panic.
 	s, _ := base64.StdEncoding.DecodeString("aAEAIDoKKDoKICA6CgkKCiA6CiA6CgkpCiA6CiA6CiA6Cig6CiAgOgoJCgogOgogOgoJKQogOgogOgogOgogOgogOgoJOg86CiA6CiA6Cig6CiAyCg==")
 	header := new(RequestHeader)
-	header.parse(s) //nolint:errcheck
+	if _, err := header.parse(s); err == nil {
+		t.Error("expected error, got <nil>")
+	}
+}
+
+func TestRequestHeaderLooseBackslashR(t *testing.T) {
+	t.Parallel()
+
+	s := "GET / HTTP/1.1\r\n" +
+		"Host: go.dev\r\n" +
+		"\rFoo: bar\r\n" +
+		"\r\n"
+	header := new(RequestHeader)
+	if _, err := header.parse([]byte(s)); err == nil {
+		t.Fatal("expected error, got <nil>")
+	}
 }
 
 func TestResponseHeaderEmptyValueFromHeader(t *testing.T) {
@@ -75,9 +375,9 @@ func TestResponseHeaderEmptyValueFromHeader(t *testing.T) {
 	var h ResponseHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if string(h.ContentType()) != string(h1.ContentType()) {
+	if !bytes.Equal(h.ContentType(), h1.ContentType()) {
 		t.Fatalf("unexpected content-type: %q. Expecting %q", h.ContentType(), h1.ContentType())
 	}
 	v1 := h.Peek("EmptyValue1")
@@ -102,7 +402,7 @@ func TestResponseHeaderEmptyValueFromString(t *testing.T) {
 	var h ResponseHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(h.ContentType()) != "foo/bar" {
 		t.Fatalf("unexpected content-type: %q. Expecting %q", h.ContentType(), "foo/bar")
@@ -130,9 +430,9 @@ func TestRequestHeaderEmptyValueFromHeader(t *testing.T) {
 	var h RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if string(h.Host()) != string(h1.Host()) {
+	if !bytes.Equal(h.Host(), h1.Host()) {
 		t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), h1.Host())
 	}
 	v1 := h.Peek("EmptyValue1")
@@ -156,7 +456,7 @@ func TestRequestHeaderEmptyValueFromString(t *testing.T) {
 	var h RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(h.Host()) != "foobar" {
 		t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "foobar")
@@ -171,11 +471,53 @@ func TestRequestHeaderEmptyValueFromString(t *testing.T) {
 	}
 }
 
+func TestRequestHeaderReadMixedLineEndings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("lf-line-crlf-terminator", func(t *testing.T) {
+		// The raw header block ends with CRLFCRLF, so the scanner takes the
+		// blockEnd fast path even though a header line uses a bare LF.
+		var h RequestHeader
+		br := bufio.NewReader(bytes.NewBufferString("GET / HTTP/1.1\r\nHost: a\nFoo: bar\r\n\r\n"))
+		if err := h.Read(br); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(h.Host()) != "a" {
+			t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "a")
+		}
+		if string(h.Peek("Foo")) != "bar" {
+			t.Fatalf("unexpected Foo value: %q. Expecting %q", h.Peek("Foo"), "bar")
+		}
+	})
+	t.Run("lf-terminated-block-with-crlf-following", func(t *testing.T) {
+		// readRawHeaders ends the block at "\n\r\n", which is not CRLFCRLF,
+		// so the scanner falls back to scanning for the terminator itself.
+		var h RequestHeader
+		br := bufio.NewReader(bytes.NewBufferString("GET / HTTP/1.1\r\nHost: a\n\r\n\r\n"))
+		if err := h.Read(br); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(h.Host()) != "a" {
+			t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "a")
+		}
+	})
+	t.Run("lf-only-terminator", func(t *testing.T) {
+		// A header block terminated only by "\n\n" contains no CRLFCRLF and
+		// must be rejected, not accepted via the blockEnd fast path.
+		var h RequestHeader
+		br := bufio.NewReader(bytes.NewBufferString("GET / HTTP/1.1\r\nHost: a\n\n"))
+		if err := h.Read(br); err == nil {
+			t.Fatal("expecting error when header block is terminated by bare LFs")
+		}
+	})
+}
+
 func TestRequestRawHeaders(t *testing.T) {
 	t.Parallel()
 
 	kvs := "hOsT: foobar\r\n" +
 		"value:  b\r\n" +
+		"uSeR agent: agent\r\n" +
 		"\r\n"
 	t.Run("normalized", func(t *testing.T) {
 		s := "GET / HTTP/1.1\r\n" + kvs
@@ -183,7 +525,7 @@ func TestRequestRawHeaders(t *testing.T) {
 		var h RequestHeader
 		br := bufio.NewReader(bytes.NewBufferString(s))
 		if err := h.Read(br); err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
 		if string(h.Host()) != "foobar" {
 			t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "foobar")
@@ -191,6 +533,12 @@ func TestRequestRawHeaders(t *testing.T) {
 		v2 := h.Peek("Value")
 		if !bytes.Equal(v2, []byte{'b'}) {
 			t.Fatalf("expecting non empty value. Got %q", v2)
+		}
+		// We accept invalid headers with a space.
+		// See: https://github.com/valyala/fasthttp/issues/1917
+		v3 := h.Peek("uSeR agent")
+		if !bytes.Equal(v3, []byte("agent")) {
+			t.Fatalf("expecting non empty value. Got %q", v3)
 		}
 		if raw := h.RawHeaders(); string(raw) != exp {
 			t.Fatalf("expected header %q, got %q", exp, raw)
@@ -209,7 +557,7 @@ func TestRequestRawHeaders(t *testing.T) {
 			var h RequestHeader
 			br := bufio.NewReader(bytes.NewBufferString(s))
 			if err := h.Read(br); err != nil {
-				t.Fatalf("unexpected error: %s", err)
+				t.Fatalf("unexpected error: %v", err)
 			}
 			if string(h.Host()) != "foobar" {
 				t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "foobar")
@@ -229,7 +577,7 @@ func TestRequestRawHeaders(t *testing.T) {
 		var h RequestHeader
 		br := bufio.NewReader(bytes.NewBufferString(s))
 		if err := h.Read(br); err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
 		if string(h.Host()) != "foobar" {
 			t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "foobar")
@@ -243,15 +591,15 @@ func TestRequestRawHeaders(t *testing.T) {
 		}
 	})
 	t.Run("no-kvs", func(t *testing.T) {
-		s := "GET / HTTP/1.1\r\n\r\n"
+		s := "GET / HTTP/1.0\r\n\r\n"
 		exp := ""
 		var h RequestHeader
 		h.DisableNormalizing()
 		br := bufio.NewReader(bytes.NewBufferString(s))
 		if err := h.Read(br); err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if string(h.Host()) != "" {
+		if len(h.Host()) != 0 {
 			t.Fatalf("unexpected host: %q. Expecting %q", h.Host(), "")
 		}
 		v1 := h.Peek("NoKey")
@@ -264,21 +612,146 @@ func TestRequestRawHeaders(t *testing.T) {
 	})
 }
 
+func TestRequestDisableSpecialHeaders(t *testing.T) {
+	t.Parallel()
+
+	// Test original header functionality
+	kvs := "Host: foobar\r\n" +
+		"User-Agent: ua\r\n" +
+		"Non-Special: val\r\n" +
+		"\r\n"
+
+	var h RequestHeader
+	h.DisableSpecialHeader()
+
+	s := "GET / HTTP/1.0\r\n" + kvs
+	br := bufio.NewReader(bytes.NewBufferString(s))
+	if err := h.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// assert order of all headers preserved
+	if h.String() != s {
+		t.Fatalf("Headers not equal: %q. Expecting %q", h.String(), s)
+	}
+	h.SetCanonical([]byte("host"), []byte("notfoobar"))
+	if string(h.Host()) != "foobar" {
+		t.Fatalf("unexpected: %q. Expecting %q", h.Host(), "foobar")
+	}
+	if h.String() != "GET / HTTP/1.0\r\nHost: foobar\r\nUser-Agent: ua\r\nNon-Special: val\r\nhost: notfoobar\r\n\r\n" {
+		t.Fatalf("custom special header ordering failed: %q", h.String())
+	}
+
+	// Test body parsing with DisableSpecialHeader - should work correctly after fix
+	testBody := "a=b&test=123"
+	rawRequest := "POST /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Content-Type: application/x-www-form-urlencoded\r\n" +
+		"Content-Length: " + strconv.Itoa(len(testBody)) + "\r\n" +
+		"\r\n" +
+		testBody
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br2 := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br2, 0); err != nil {
+		t.Fatalf("unexpected error reading request: %v", err)
+	}
+
+	// Verify Content-Length is correctly parsed with DisableSpecialHeader
+	if req.Header.ContentLength() != len(testBody) {
+		t.Fatalf("ContentLength() incorrect with DisableSpecialHeader: got %d, expected %d",
+			req.Header.ContentLength(), len(testBody))
+	}
+
+	// Verify body is preserved with DisableSpecialHeader
+	if string(req.Body()) != testBody {
+		t.Fatalf("body content incorrect with DisableSpecialHeader: got %q, expected %q",
+			string(req.Body()), testBody)
+	}
+
+	var ambiguous Request
+	ambiguous.Header.DisableSpecialHeader()
+	br3 := bufio.NewReader(bytes.NewBufferString("POST /test HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n"))
+	if err := ambiguous.ReadLimitBody(br3, 0); err != nil {
+		t.Fatalf("unexpected error reading ambiguous request: %v", err)
+	}
+	if body := string(ambiguous.Body()); body != "test" {
+		t.Fatalf("body content incorrect with ambiguous framing: got %q, expected %q", body, "test")
+	}
+}
+
+func TestRequestDisableSpecialHeadersChunked(t *testing.T) {
+	t.Parallel()
+
+	testBody := "chunked-test"
+	rawRequest := "POST /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"\r\n" +
+		"c\r\n" +
+		testBody + "\r\n" +
+		"0\r\n\r\n"
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br, 0); err != nil {
+		t.Fatalf("unexpected error reading chunked request: %v", err)
+	}
+
+	// Verify chunked encoding is detected
+	if req.Header.ContentLength() != -1 {
+		t.Fatalf("chunked encoding not detected with DisableSpecialHeader: got %d, expected -1",
+			req.Header.ContentLength())
+	}
+
+	// Verify chunked body is preserved
+	if string(req.Body()) != testBody {
+		t.Fatalf("chunked body incorrect with DisableSpecialHeader: got %q, expected %q",
+			string(req.Body()), testBody)
+	}
+}
+
+func TestRequestDisableSpecialHeadersIdentity(t *testing.T) {
+	t.Parallel()
+
+	rawRequest := "GET /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"\r\n"
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br, 0); err != nil {
+		t.Fatalf("unexpected error reading identity request: %v", err)
+	}
+
+	// Verify identity encoding is detected
+	if req.Header.ContentLength() != -2 {
+		t.Fatalf("identity encoding not detected with DisableSpecialHeader: got %d, expected -2",
+			req.Header.ContentLength())
+	}
+}
+
 func TestRequestHeaderSetCookieWithSpecialChars(t *testing.T) {
 	t.Parallel()
 
 	var h RequestHeader
 	h.Set("Cookie", "ID&14")
 	s := h.String()
+	s = strings.Replace(s, "\r\n", "\r\nHost: example.com\r\n", 1)
 
 	if !strings.Contains(s, "Cookie: ID&14") {
-		t.Fatalf("Missing cookie in request header: [%s]", s)
+		t.Fatalf("Missing cookie in request header: %q", s)
 	}
 
 	var h1 RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	cookie := h1.Peek(HeaderCookie)
 	if string(cookie) != "ID&14" {
@@ -317,7 +790,7 @@ func TestResponseHeaderDelClientCookie(t *testing.T) {
 		t.Fatalf("expecting cookie %q", c.Key())
 	}
 	if !c.Expire().Equal(CookieExpireDelete) {
-		t.Fatalf("unexpected cookie expiration time: %s. Expecting %s", c.Expire(), CookieExpireDelete)
+		t.Fatalf("unexpected cookie expiration time: %q. Expecting %q", c.Expire(), CookieExpireDelete)
 	}
 	if len(c.Value()) > 0 {
 		t.Fatalf("unexpected cookie value: %q. Expecting empty value", c.Value())
@@ -328,73 +801,93 @@ func TestResponseHeaderDelClientCookie(t *testing.T) {
 func TestResponseHeaderAdd(t *testing.T) {
 	t.Parallel()
 
+	const raw = "foo\r\nX-Injected: yes"
+	const sanitized = "foo  X-Injected: yes"
+
 	m := make(map[string]struct{})
 	var h ResponseHeader
 	h.Add("aaa", "bbb")
+	h.Add("content-type", "xxx")
+	h.Add("x-newline", raw)
 	m["bbb"] = struct{}{}
-	for i := 0; i < 10; i++ {
-		v := fmt.Sprintf("%d", i)
+	m["xxx"] = struct{}{}
+	m[sanitized] = struct{}{}
+	for i := range 10 {
+		v := strconv.Itoa(i)
 		h.Add("Foo-Bar", v)
 		m[v] = struct{}{}
 	}
-	if h.Len() != 12 {
-		t.Fatalf("unexpected header len %d. Expecting 12", h.Len())
+	if h.Len() != 13 {
+		t.Fatalf("unexpected header len %d. Expecting 13", h.Len())
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
-		case "Aaa", "Foo-Bar":
+		case "Aaa", "Foo-Bar", "Content-Type", "X-Newline":
 			if _, ok := m[string(v)]; !ok {
 				t.Fatalf("unexpected value found %q. key %q", v, k)
 			}
 			delete(m, string(v))
-		case "Content-Type":
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) > 0 {
 		t.Fatalf("%d headers are missed", len(m))
 	}
+	if got := string(h.Peek("x-newline")); got != sanitized {
+		t.Fatalf("unexpected sanitized value %q. Expecting %q", got, sanitized)
+	}
 
 	s := h.String()
+	if strings.Contains(s, "\r\nX-Injected: yes\r\n") {
+		t.Fatalf("serialized response header contains injected header line: %q", s)
+	}
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	var h1 ResponseHeader
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
-		case "Aaa", "Foo-Bar":
+		case "Aaa", "Foo-Bar", "Content-Type", "X-Newline":
 			m[string(v)] = struct{}{}
-		case "Content-Type":
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
-	if len(m) != 11 {
-		t.Fatalf("unexpected number of headers: %d. Expecting 11", len(m))
+	}
+	if len(m) != 13 {
+		t.Fatalf("unexpected number of headers: %d. Expecting 13", len(m))
 	}
 }
 
 func TestRequestHeaderAdd(t *testing.T) {
+	t.Parallel()
+
+	const raw = "foo\r\nX-Injected: yes"
+	const sanitized = "foo  X-Injected: yes"
+
 	m := make(map[string]struct{})
 	var h RequestHeader
 	h.Add("aaa", "bbb")
+	h.Add("user-agent", "xxx")
+	h.Add("x-newline", raw)
 	m["bbb"] = struct{}{}
-	for i := 0; i < 10; i++ {
-		v := fmt.Sprintf("%d", i)
+	m["xxx"] = struct{}{}
+	m[sanitized] = struct{}{}
+	for i := range 10 {
+		v := strconv.Itoa(i)
 		h.Add("Foo-Bar", v)
 		m[v] = struct{}{}
 	}
-	if h.Len() != 11 {
-		t.Fatalf("unexpected header len %d. Expecting 11", h.Len())
+	if h.Len() != 13 {
+		t.Fatalf("unexpected header len %d. Expecting 13", h.Len())
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
-		case "Aaa", "Foo-Bar":
+		case "Aaa", "Foo-Bar", "User-Agent", "X-Newline":
 			if _, ok := m[string(v)]; !ok {
 				t.Fatalf("unexpected value found %q. key %q", v, k)
 			}
@@ -402,33 +895,39 @@ func TestRequestHeaderAdd(t *testing.T) {
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) > 0 {
 		t.Fatalf("%d headers are missed", len(m))
 	}
-
-	s := h.String()
-	br := bufio.NewReader(bytes.NewBufferString(s))
-	var h1 RequestHeader
-	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+	if got := string(h.Peek("x-newline")); got != sanitized {
+		t.Fatalf("unexpected sanitized value %q. Expecting %q", got, sanitized)
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	s := h.String()
+	if strings.Contains(s, "\r\nX-Injected: yes\r\n") {
+		t.Fatalf("serialized request header contains injected header line: %q", s)
+	}
+	sWithHost := strings.Replace(s, "User-Agent: xxx\r\n", "User-Agent: xxx\r\nHost: example.com\r\n", 1)
+	br := bufio.NewReader(bytes.NewBufferString(sWithHost))
+	var h1 RequestHeader
+	if err := h1.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for k, v := range h.All() {
 		switch string(k) {
-		case "Aaa", "Foo-Bar":
+		case "Aaa", "Foo-Bar", "User-Agent", "X-Newline":
 			m[string(v)] = struct{}{}
-		case "User-Agent":
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
-	if len(m) != 11 {
-		t.Fatalf("unexpected number of headers: %d. Expecting 11", len(m))
+	}
+	if len(m) != 13 {
+		t.Fatalf("unexpected number of headers: %d. Expecting 13", len(m))
 	}
 	s1 := h1.String()
-	if s != s1 {
-		t.Fatalf("unexpected headers %q. Expecting %q", s1, s)
+	if sWithHost != s1 {
+		t.Fatalf("unexpected headers %q. Expecting %q", s1, sWithHost)
 	}
 }
 
@@ -469,6 +968,7 @@ func TestRequestHeaderDel(t *testing.T) {
 	h.Set("User-Agent", "asdfas")
 	h.Set("Content-Length", "1123")
 	h.Set("Cookie", "foobar=baz")
+	h.Set(HeaderTrailer, "foo, bar")
 
 	h.Del("foo-bar")
 	h.Del("connection")
@@ -477,6 +977,7 @@ func TestRequestHeaderDel(t *testing.T) {
 	h.Del("user-agent")
 	h.Del("content-length")
 	h.Del("cookie")
+	h.Del("trailer")
 
 	hv := h.Peek("aaa")
 	if string(hv) != "bbb" {
@@ -510,10 +1011,14 @@ func TestRequestHeaderDel(t *testing.T) {
 	if len(hv) > 0 {
 		t.Fatalf("non-zero value: %q", hv)
 	}
+	hv = h.Peek(HeaderTrailer)
+	if len(hv) > 0 {
+		t.Fatalf("non-zero value: %q", hv)
+	}
 
 	cv := h.Cookie("foobar")
 	if len(cv) > 0 {
-		t.Fatalf("unexpected cookie obtianed: %q", cv)
+		t.Fatalf("unexpected cookie obtained: %q", cv)
 	}
 	if h.ContentLength() != 0 {
 		t.Fatalf("unexpected content-length: %d. Expecting 0", h.ContentLength())
@@ -528,8 +1033,10 @@ func TestResponseHeaderDel(t *testing.T) {
 	h.Set("aaa", "bbb")
 	h.Set(HeaderConnection, "keep-alive")
 	h.Set(HeaderContentType, "aaa")
+	h.Set(HeaderContentEncoding, "gzip")
 	h.Set(HeaderServer, "aaabbb")
 	h.Set(HeaderContentLength, "1123")
+	h.Set(HeaderTrailer, "foo, bar")
 
 	var c Cookie
 	c.SetKey("foo")
@@ -542,6 +1049,7 @@ func TestResponseHeaderDel(t *testing.T) {
 	h.Del(HeaderServer)
 	h.Del("content-length")
 	h.Del("set-cookie")
+	h.Del("trailer")
 
 	hv := h.Peek("aaa")
 	if string(hv) != "bbb" {
@@ -556,8 +1064,12 @@ func TestResponseHeaderDel(t *testing.T) {
 		t.Fatalf("non-zero value: %q", hv)
 	}
 	hv = h.Peek(HeaderContentType)
-	if string(hv) != string(defaultContentType) {
+	if !bytes.Equal(hv, defaultContentType) {
 		t.Fatalf("unexpected content-type: %q. Expecting %q", hv, defaultContentType)
+	}
+	hv = h.Peek(HeaderContentEncoding)
+	if string(hv) != "gzip" {
+		t.Fatalf("unexpected content-encoding: %q. Expecting %q", hv, "gzip")
 	}
 	hv = h.Peek(HeaderServer)
 	if len(hv) > 0 {
@@ -567,12 +1079,61 @@ func TestResponseHeaderDel(t *testing.T) {
 	if len(hv) > 0 {
 		t.Fatalf("non-zero value: %q", hv)
 	}
+	hv = h.Peek(HeaderTrailer)
+	if len(hv) > 0 {
+		t.Fatalf("non-zero value: %q", hv)
+	}
 
 	if h.Cookie(&c) {
-		t.Fatalf("unexpected cookie obtianed: %q", &c)
+		t.Fatalf("unexpected cookie obtained: %q", &c)
 	}
 	if h.ContentLength() != 0 {
 		t.Fatalf("unexpected content-length: %d. Expecting 0", h.ContentLength())
+	}
+}
+
+func TestResponseHeaderSetTrailerGetBytes(t *testing.T) {
+	t.Parallel()
+
+	h := &ResponseHeader{}
+	h.noDefaultDate = true
+	h.Set("Foo", "bar")
+	h.Set(HeaderTrailer, "Baz")
+	h.Set("Baz", "test")
+
+	headerBytes := h.Header()
+	n, err := h.parseFirstLine(headerBytes)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if string(headerBytes[n:]) != "Foo: bar\r\nTrailer: Baz\r\n\r\n" {
+		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\r\nTrailer: Baz\r\n\r\n")
+	}
+	if string(h.TrailerHeader()) != "Baz: test\r\n\r\n" {
+		t.Fatalf("Unexpected trailer header: %q. Expected %q", h.TrailerHeader(), "Baz: test\r\n\r\n")
+	}
+}
+
+func TestRequestHeaderSetTrailerGetBytes(t *testing.T) {
+	t.Parallel()
+
+	h := &RequestHeader{}
+	h.Set("Foo", "bar")
+	h.Set(HeaderTrailer, "Baz")
+	h.Set("Baz", "test")
+
+	headerBytes := h.Header()
+	n, err := h.parseFirstLine(headerBytes)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if string(headerBytes[n:]) != "Foo: bar\r\nTrailer: Baz\r\n\r\n" {
+		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\nTrailer: Baz\r\n\r\n")
+	}
+	if string(h.TrailerHeader()) != "Baz: test\r\n\r\n" {
+		t.Fatalf("Unexpected trailer header: %q. Expected %q", h.TrailerHeader(), "Baz: test\r\n\r\n")
 	}
 }
 
@@ -600,7 +1161,7 @@ func TestRequestHeaderHTTP10ConnectionClose(t *testing.T) {
 	var h RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if !h.ConnectionClose() {
@@ -615,7 +1176,7 @@ func TestRequestHeaderHTTP10ConnectionKeepAlive(t *testing.T) {
 	var h RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if h.ConnectionClose() {
@@ -632,7 +1193,7 @@ func TestBufferSnippet(t *testing.T) {
 	b := string(createFixedBody(199))
 	bExpected := fmt.Sprintf("%q", b)
 	testBufferSnippet(t, b, bExpected)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b += "foobar"
 		bExpected = fmt.Sprintf("%q", b)
 		testBufferSnippet(t, b, bExpected)
@@ -641,7 +1202,7 @@ func TestBufferSnippet(t *testing.T) {
 	b = string(createFixedBody(400))
 	bExpected = fmt.Sprintf("%q", b)
 	testBufferSnippet(t, b, bExpected)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b += "sadfqwer"
 		bExpected = fmt.Sprintf("%q...%q", b[:200], b[len(b)-200:])
 		testBufferSnippet(t, b, bExpected)
@@ -651,7 +1212,7 @@ func TestBufferSnippet(t *testing.T) {
 func testBufferSnippet(t *testing.T, buf, expectedSnippet string) {
 	snippet := bufferSnippet([]byte(buf))
 	if snippet != expectedSnippet {
-		t.Fatalf("unexpected snippet %s. Expecting %s", snippet, expectedSnippet)
+		t.Fatalf("unexpected snippet %q. Expecting %q", snippet, expectedSnippet)
 	}
 }
 
@@ -664,7 +1225,7 @@ func TestResponseHeaderTrailingCRLFSuccess(t *testing.T) {
 	var r ResponseHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := r.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// try reading the trailing CRLF. It must return EOF
@@ -673,7 +1234,7 @@ func TestResponseHeaderTrailingCRLFSuccess(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err != io.EOF {
-		t.Fatalf("unexpected error: %s. Expecting %s", err, io.EOF)
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.EOF)
 	}
 }
 
@@ -686,7 +1247,7 @@ func TestResponseHeaderTrailingCRLFError(t *testing.T) {
 	var r ResponseHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := r.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// try reading the trailing CRLF. It must return EOF
@@ -695,7 +1256,7 @@ func TestResponseHeaderTrailingCRLFError(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err == io.EOF {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -708,7 +1269,7 @@ func TestRequestHeaderTrailingCRLFSuccess(t *testing.T) {
 	var r RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := r.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// try reading the trailing CRLF. It must return EOF
@@ -717,7 +1278,7 @@ func TestRequestHeaderTrailingCRLFSuccess(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err != io.EOF {
-		t.Fatalf("unexpected error: %s. Expecting %s", err, io.EOF)
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.EOF)
 	}
 }
 
@@ -730,7 +1291,7 @@ func TestRequestHeaderTrailingCRLFError(t *testing.T) {
 	var r RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := r.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// try reading the trailing CRLF. It must return EOF
@@ -739,7 +1300,7 @@ func TestRequestHeaderTrailingCRLFError(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err == io.EOF {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -754,7 +1315,7 @@ func TestRequestHeaderReadEOF(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err != io.EOF {
-		t.Fatalf("unexpected error: %s. Expecting %s", err, io.EOF)
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.EOF)
 	}
 
 	// incomplete request header mustn't return io.EOF
@@ -779,7 +1340,7 @@ func TestResponseHeaderReadEOF(t *testing.T) {
 		t.Fatalf("expecting error")
 	}
 	if err != io.EOF {
-		t.Fatalf("unexpected error: %s. Expecting %s", err, io.EOF)
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.EOF)
 	}
 
 	// incomplete response header mustn't return io.EOF
@@ -802,14 +1363,19 @@ func TestResponseHeaderOldVersion(t *testing.T) {
 	s += "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nContent-Type: ass\r\nConnection: keep-alive\r\n\r\n42"
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if !h.ConnectionClose() {
 		t.Fatalf("expecting 'Connection: close' for the response with old http protocol")
 	}
 
+	// Discard the body of the first response.
+	if n, err := br.Discard(h.ContentLength()); err != nil || n != h.ContentLength() {
+		t.Fatalf("unexpected discard: n=%d, want=%d, err=%v", n, h.ContentLength(), err)
+	}
+
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if h.ConnectionClose() {
 		t.Fatalf("unexpected 'Connection: close' for keep-alive response with old http protocol")
@@ -817,6 +1383,8 @@ func TestResponseHeaderOldVersion(t *testing.T) {
 }
 
 func TestRequestHeaderSetByteRange(t *testing.T) {
+	t.Parallel()
+
 	testRequestHeaderSetByteRange(t, 0, 10, "bytes=0-10")
 	testRequestHeaderSetByteRange(t, 123, -1, "bytes=123-")
 	testRequestHeaderSetByteRange(t, -234, 58349, "bytes=-234")
@@ -875,6 +1443,86 @@ func testRequestHeaderHasAcceptEncoding(t *testing.T, ae, v string, resultExpect
 	}
 }
 
+func TestVisitHeaderParams(t *testing.T) {
+	t.Parallel()
+	testVisitHeaderParams(t, "text/plain;charset=utf-8;q=0.39", [][2]string{{"charset", "utf-8"}, {"q", "0.39"}})
+	testVisitHeaderParams(t, "text/plain;   foo=bar   ;", [][2]string{{"foo", "bar"}})
+	testVisitHeaderParams(t, `text/plain;      foo="bar";   `, [][2]string{{"foo", "bar"}})
+	testVisitHeaderParams(t, `text/plain; foo="text/plain,text/html;charset=\"utf-8\""`, [][2]string{{"foo", `text/plain,text/html;charset=\"utf-8\"`}})
+	testVisitHeaderParams(t, "text/plain foo=bar", [][2]string{})
+	testVisitHeaderParams(t, "text/plain;", [][2]string{})
+	testVisitHeaderParams(t, "text/plain; ", [][2]string{})
+	testVisitHeaderParams(t, "text/plain; foo", [][2]string{})
+	testVisitHeaderParams(t, "text/plain; foo=", [][2]string{})
+	testVisitHeaderParams(t, "text/plain; =bar", [][2]string{})
+	testVisitHeaderParams(t, "text/plain; foo = bar", [][2]string{})
+	testVisitHeaderParams(t, `text/plain; foo="bar`, [][2]string{})
+	testVisitHeaderParams(t, "text/plain;;foo=bar", [][2]string{{"foo", "bar"}})
+
+	parsed := make([][2]string, 0)
+	VisitHeaderParams([]byte(`text/plain; ; foo=bar; ; charset=utf-8`), func(key, value []byte) bool {
+		parsed = append(parsed, [2]string{string(key), string(value)})
+		return !bytes.Equal(key, []byte("foo"))
+	})
+
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 HTTP parameter, parsed %v", len(parsed))
+	}
+
+	if parsed[0] != [2]string{"foo", "bar"} {
+		t.Fatalf("unexpected parameter %v=%v. Expecting foo=bar", parsed[0][0], parsed[0][1])
+	}
+}
+
+func TestVisitHeaderParamsEmptyParameters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		header string
+		params [][2]string
+	}{
+		{"leading", "text/plain;;;charset=utf-8", [][2]string{{"charset", "utf-8"}}},
+		{"middle", "text/plain;charset=utf-8;;q=0.39", [][2]string{{"charset", "utf-8"}, {"q", "0.39"}}},
+		{"trailing", "text/plain;charset=utf-8;;;", [][2]string{{"charset", "utf-8"}}},
+		{"spaces", "multipart/form-data; ; boundary=x", [][2]string{{"boundary", "x"}}},
+		{"tabs", "text/plain;\t; \t;\tcharset=utf-8", [][2]string{{"charset", "utf-8"}}},
+		{"only empty", "text/plain; \t;\t;; ", nil},
+		{"quoted semicolon", `text/plain;;foo="a;b";;charset=utf-8`, [][2]string{{"foo", "a;b"}, {"charset", "utf-8"}}},
+		{"quoted escape", `text/plain;;foo="a\";b";;charset=utf-8`, [][2]string{{"foo", `a\";b`}, {"charset", "utf-8"}}},
+		{"quoted empty", `text/plain;;foo="";;charset=utf-8`, [][2]string{{"foo", ""}, {"charset", "utf-8"}}},
+		{"missing equals", "text/plain;;foo; charset=utf-8", nil},
+		{"missing value", "text/plain;;foo=; charset=utf-8", nil},
+		{"invalid name", "text/plain;;=bar; charset=utf-8", nil},
+		{"invalid whitespace", "text/plain;;foo = bar; charset=utf-8", nil},
+		{"unclosed quote", `text/plain;;foo="bar; charset=utf-8`, nil},
+		{"invalid after valid", "text/plain;;q=0.39;;foo; charset=utf-8", [][2]string{{"q", "0.39"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testVisitHeaderParams(t, tt.header, tt.params)
+		})
+	}
+}
+
+func testVisitHeaderParams(t *testing.T, header string, expectedParams [][2]string) {
+	parsed := make([][2]string, 0)
+	VisitHeaderParams([]byte(header), func(key, value []byte) bool {
+		parsed = append(parsed, [2]string{string(key), string(value)})
+		return true
+	})
+
+	if len(parsed) != len(expectedParams) {
+		t.Fatalf("expected %v HTTP parameters, parsed %v", len(expectedParams), len(parsed))
+	}
+
+	for i := range expectedParams {
+		if expectedParams[i] != parsed[i] {
+			t.Fatalf("unexpected parameter %v=%v. Expecting %v=%v", parsed[i][0], parsed[i][1], expectedParams[i][0], expectedParams[i][1])
+		}
+	}
+}
+
 func TestRequestMultipartFormBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -895,6 +1543,28 @@ func TestRequestMultipartFormBoundary(t *testing.T) {
 	// quoted boundary
 	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=\"foobar\"\r\n\r\n", "foobar")
 
+	// media type and parameter name are case-insensitive, the boundary value is not
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: Multipart/Form-Data; boundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; Boundary=FooBar\r\n\r\n", "FooBar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: MULTIPART/FORM-DATA; foo=bar; BOUNDARY=foobar\r\n\r\n", "foobar")
+
+	// optional whitespace around ';'
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data ; boundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data\t;\tboundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; foo=bar ;\tboundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=foobar ; foo=bar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=\"foobar\"\t; foo=bar\r\n\r\n", "foobar")
+
+	// no whitespace allowed around '='
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary =foobar\r\n\r\n", "")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-dataX; boundary=foobar\r\n\r\n", "")
+
+	// ';' inside a quoted parameter value doesn't end the parameter
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; foo=\"a;boundary=bar\"; boundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; foo=\"a\\\";boundary=bar\"; boundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; foo=\"a\\\\\"; boundary=foobar\r\n\r\n", "foobar")
+	testRequestMultipartFormBoundary(t, "POST / HTTP/1.1\r\nContent-Type: multipart/form-data; foo=\"a;boundary=bar\r\n\r\n", "")
+
 	var h RequestHeader
 	h.SetMultipartFormBoundary("foobarbaz")
 	b := h.MultipartFormBoundary()
@@ -904,11 +1574,15 @@ func TestRequestMultipartFormBoundary(t *testing.T) {
 }
 
 func testRequestMultipartFormBoundary(t *testing.T, s, boundary string) {
+	if strings.HasPrefix(s, "POST / HTTP/1.1\r\n") && !strings.Contains(s, "\r\nHost: ") {
+		s = strings.Replace(s, "\r\n", "\r\nHost: example.com\r\n", 1)
+	}
+
 	var h RequestHeader
 	r := bytes.NewBufferString(s)
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s. s=%q, boundary=%q", err, s, boundary)
+		t.Fatalf("unexpected error: %v. s=%q, boundary=%q", err, s, boundary)
 	}
 
 	b := h.MultipartFormBoundary()
@@ -946,7 +1620,7 @@ func testResponseHeaderConnectionUpgrade(t *testing.T, s string, isUpgrade, isKe
 	r := bytes.NewBufferString(s)
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s. Response header %q", err, s)
+		t.Fatalf("unexpected error: %v. Response header %q", err, s)
 	}
 	upgrade := h.ConnectionUpgrade()
 	if upgrade != isUpgrade {
@@ -993,7 +1667,7 @@ func testRequestHeaderConnectionUpgrade(t *testing.T, s string, isUpgrade, isKee
 	r := bytes.NewBufferString(s)
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s. Request header %q", err, s)
+		t.Fatalf("unexpected error: %v. Request header %q", err, s)
 	}
 	upgrade := h.ConnectionUpgrade()
 	if upgrade != isUpgrade {
@@ -1015,21 +1689,21 @@ func TestRequestHeaderProxyWithCookie(t *testing.T) {
 	r := bytes.NewBufferString("GET /foo HTTP/1.1\r\nFoo: bar\r\nHost: aaa.com\r\nCookie: foo=bar; bazzz=aaaaaaa; x=y\r\nCookie: aqqqqq=123\r\n\r\n")
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	w := &bytes.Buffer{}
 	bw := bufio.NewWriter(w)
 	if err := h.Write(bw); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var h1 RequestHeader
 	br.Reset(w)
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if string(h1.RequestURI()) != "/foo" {
 		t.Fatalf("unexpected requestURI: %q. Expecting %q", h1.RequestURI(), "/foo")
@@ -1041,7 +1715,7 @@ func TestRequestHeaderProxyWithCookie(t *testing.T) {
 		t.Fatalf("unexpected Foo: %q. Expecting %q", h1.Peek("Foo"), "bar")
 	}
 	if string(h1.Cookie("foo")) != "bar" {
-		t.Fatalf("unexpected coookie foo=%q. Expecting %q", h1.Cookie("foo"), "bar")
+		t.Fatalf("unexpected cookie foo=%q. Expecting %q", h1.Cookie("foo"), "bar")
 	}
 	if string(h1.Cookie("bazzz")) != "aaaaaaa" {
 		t.Fatalf("unexpected cookie bazzz=%q. Expecting %q", h1.Cookie("bazzz"), "aaaaaaa")
@@ -1054,48 +1728,19 @@ func TestRequestHeaderProxyWithCookie(t *testing.T) {
 	}
 }
 
-func TestPeekRawHeader(t *testing.T) {
-	t.Parallel()
-
-	// empty header
-	testPeekRawHeader(t, "", "Foo-Bar", "")
-
-	// different case
-	testPeekRawHeader(t, "Content-Length: 3443\r\n", "content-length", "")
-
-	// no trailing crlf
-	testPeekRawHeader(t, "Content-Length: 234", "Content-Length", "")
-
-	// single header
-	testPeekRawHeader(t, "Content-Length: 12345\r\n", "Content-Length", "12345")
-
-	// multiple headers
-	testPeekRawHeader(t, "Host: foobar\r\nContent-Length: 434\r\nFoo: bar\r\n\r\n", "Content-Length", "434")
-
-	// lf without cr
-	testPeekRawHeader(t, "Foo: bar\nConnection: close\nAaa: bbb\ncc: ddd\n", "Connection", "close")
-}
-
-func testPeekRawHeader(t *testing.T, rawHeaders, key string, expectedValue string) {
-	v := peekRawHeader([]byte(rawHeaders), []byte(key))
-	if string(v) != expectedValue {
-		t.Fatalf("unexpected raw headers value %q. Expected %q. key %q, rawHeaders %q", v, expectedValue, key, rawHeaders)
-	}
-}
-
 func TestResponseHeaderFirstByteReadEOF(t *testing.T) {
 	t.Parallel()
 
 	var h ResponseHeader
 
-	r := &errorReader{fmt.Errorf("non-eof error")}
+	r := &errorReader{err: errors.New("non-eof error")}
 	br := bufio.NewReader(r)
 	err := h.Read(br)
 	if err == nil {
 		t.Fatalf("expecting error")
 	}
 	if err != io.EOF {
-		t.Fatalf("unexpected error %s. Expecting %s", err, io.EOF)
+		t.Fatalf("unexpected error %v. Expecting %v", err, io.EOF)
 	}
 }
 
@@ -1122,11 +1767,12 @@ func TestResponseHeaderHTTPVer(t *testing.T) {
 
 	// non-http/1.1
 	testResponseHeaderHTTPVer(t, "HTTP/1.0 200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", true)
+	testResponseHeaderHTTPVer(t, "HTTP/1.0   200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", true)
 	testResponseHeaderHTTPVer(t, "HTTP/0.9 200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", true)
-	testResponseHeaderHTTPVer(t, "foobar 200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", true)
 
 	// http/1.1
 	testResponseHeaderHTTPVer(t, "HTTP/1.1 200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", false)
+	testResponseHeaderHTTPVer(t, "HTTP/1.1   200 OK\r\nContent-Type: aaa\r\nContent-Length: 123\r\n\r\n", false)
 }
 
 func TestRequestHeaderHTTPVer(t *testing.T) {
@@ -1135,11 +1781,6 @@ func TestRequestHeaderHTTPVer(t *testing.T) {
 	// non-http/1.1
 	testRequestHeaderHTTPVer(t, "GET / HTTP/1.0\r\nHost: aa.com\r\n\r\n", true)
 	testRequestHeaderHTTPVer(t, "GET / HTTP/0.9\r\nHost: aa.com\r\n\r\n", true)
-	testRequestHeaderHTTPVer(t, "GET / foobar\r\nHost: aa.com\r\n\r\n", true)
-
-	// empty http version
-	testRequestHeaderHTTPVer(t, "GET /\r\nHost: aaa.com\r\n\r\n", true)
-	testRequestHeaderHTTPVer(t, "GET / \r\nHost: aaa.com\r\n\r\n", true)
 
 	// http/1.1
 	testRequestHeaderHTTPVer(t, "GET / HTTP/1.1\r\nHost: a.com\r\n\r\n", false)
@@ -1151,7 +1792,7 @@ func testResponseHeaderHTTPVer(t *testing.T, s string, connectionClose bool) {
 	r := bytes.NewBufferString(s)
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s. response=%q", err, s)
+		t.Fatalf("unexpected error: %v. response=%q", err, s)
 	}
 	if h.ConnectionClose() != connectionClose {
 		t.Fatalf("unexpected connectionClose %v. Expecting %v. response=%q", h.ConnectionClose(), connectionClose, s)
@@ -1159,12 +1800,14 @@ func testResponseHeaderHTTPVer(t *testing.T, s string, connectionClose bool) {
 }
 
 func testRequestHeaderHTTPVer(t *testing.T, s string, connectionClose bool) {
+	t.Helper()
+
 	var h RequestHeader
 
 	r := bytes.NewBufferString(s)
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s. request=%q", err, s)
+		t.Fatalf("unexpected error: %v. request=%q", err, s)
 	}
 	if h.ConnectionClose() != connectionClose {
 		t.Fatalf("unexpected connectionClose %v. Expecting %v. request=%q", h.ConnectionClose(), connectionClose, s)
@@ -1178,7 +1821,9 @@ func TestResponseHeaderCopyTo(t *testing.T) {
 
 	h.Set(HeaderSetCookie, "foo=bar")
 	h.Set(HeaderContentType, "foobar")
+	h.Set(HeaderContentEncoding, "gzip")
 	h.Set("AAA-BBB", "aaaa")
+	h.Set(HeaderTrailer, "foo, bar")
 
 	var h1 ResponseHeader
 	h.CopyTo(&h1)
@@ -1188,16 +1833,24 @@ func TestResponseHeaderCopyTo(t *testing.T) {
 	if !bytes.Equal(h1.Peek(HeaderContentType), h.Peek(HeaderContentType)) {
 		t.Fatalf("unexpected content-type %q. Expected %q", h1.Peek("content-type"), h.Peek("content-type"))
 	}
+	if !bytes.Equal(h1.Peek(HeaderContentEncoding), h.Peek(HeaderContentEncoding)) {
+		t.Fatalf("unexpected content-encoding %q. Expected %q", h1.Peek("content-encoding"), h.Peek("content-encoding"))
+	}
 	if !bytes.Equal(h1.Peek("aaa-bbb"), h.Peek("AAA-BBB")) {
 		t.Fatalf("unexpected aaa-bbb %q. Expected %q", h1.Peek("aaa-bbb"), h.Peek("aaa-bbb"))
 	}
+	if !bytes.Equal(h1.Peek(HeaderTrailer), h.Peek(HeaderTrailer)) {
+		t.Fatalf("unexpected trailer %q. Expected %q", h1.Peek(HeaderTrailer), h.Peek(HeaderTrailer))
+	}
 
 	// flush buf
-	h.bufKV = argsKV{}
-	h1.bufKV = argsKV{}
+	h.bufK = []byte{}
+	h.bufV = []byte{}
+	h1.bufK = []byte{}
+	h1.bufV = []byte{}
 
-	if !reflect.DeepEqual(h, h1) { //nolint:govet
-		t.Fatalf("ResponseHeaderCopyTo fail, src: \n%+v\ndst: \n%+v\n", h, h1) //nolint:govet
+	if !reflect.DeepEqual(&h, &h1) {
+		t.Fatalf("ResponseHeaderCopyTo fail, src: \n%+v\ndst: \n%+v\n", &h, &h1)
 	}
 }
 
@@ -1208,8 +1861,11 @@ func TestRequestHeaderCopyTo(t *testing.T) {
 
 	h.Set(HeaderCookie, "aa=bb; cc=dd")
 	h.Set(HeaderContentType, "foobar")
+	h.Set(HeaderContentEncoding, "gzip")
 	h.Set(HeaderHost, "aaaa")
 	h.Set("aaaxxx", "123")
+	h.Set(HeaderTrailer, "foo, bar")
+	h.noDefaultContentType = true
 
 	var h1 RequestHeader
 	h.CopyTo(&h1)
@@ -1219,19 +1875,27 @@ func TestRequestHeaderCopyTo(t *testing.T) {
 	if !bytes.Equal(h1.Peek("content-type"), h.Peek(HeaderContentType)) {
 		t.Fatalf("unexpected content-type %q. Expected %q", h1.Peek("content-type"), h.Peek("content-type"))
 	}
+	if !bytes.Equal(h1.Peek("content-encoding"), h.Peek(HeaderContentEncoding)) {
+		t.Fatalf("unexpected content-encoding %q. Expected %q", h1.Peek("content-encoding"), h.Peek("content-encoding"))
+	}
 	if !bytes.Equal(h1.Peek("host"), h.Peek("host")) {
 		t.Fatalf("unexpected host %q. Expected %q", h1.Peek("host"), h.Peek("host"))
 	}
 	if !bytes.Equal(h1.Peek("aaaxxx"), h.Peek("aaaxxx")) {
 		t.Fatalf("unexpected aaaxxx %q. Expected %q", h1.Peek("aaaxxx"), h.Peek("aaaxxx"))
 	}
+	if !bytes.Equal(h1.Peek(HeaderTrailer), h.Peek(HeaderTrailer)) {
+		t.Fatalf("unexpected trailer %q. Expected %q", h1.Peek(HeaderTrailer), h.Peek(HeaderTrailer))
+	}
 
 	// flush buf
-	h.bufKV = argsKV{}
-	h1.bufKV = argsKV{}
+	h.bufK = []byte{}
+	h.bufV = []byte{}
+	h1.bufK = []byte{}
+	h1.bufV = []byte{}
 
-	if !reflect.DeepEqual(h, h1) { //nolint:govet
-		t.Fatalf("RequestHeaderCopyTo fail, src: \n%+v\ndst: \n%+v\n", h, h1) //nolint:govet
+	if !reflect.DeepEqual(&h, &h1) {
+		t.Fatalf("RequestHeaderCopyTo fail, src: \n%+v\ndst: \n%+v\n", &h, &h1)
 	}
 }
 
@@ -1246,7 +1910,90 @@ func TestResponseContentTypeNoDefaultNotEmpty(t *testing.T) {
 	headers := h.String()
 
 	if strings.Contains(headers, "Content-Type: \r\n") {
-		t.Fatalf("ResponseContentTypeNoDefaultNotEmpty fail, response: \n%+v\noutcome: \n%q\n", h, headers) //nolint:govet
+		t.Fatalf("ResponseContentTypeNoDefaultNotEmpty fail, response: \n%+v\noutcome: \n%q\n", &h, headers)
+	}
+}
+
+func TestRequestContentTypeDefaultNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetMethod(MethodPost)
+	h.SetHost("example.com")
+	h.SetContentLength(5)
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := h.Write(bw); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var h1 RequestHeader
+	br := bufio.NewReader(w)
+	if err := h1.Read(br); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if string(h1.contentType) != "application/octet-stream" {
+		t.Fatalf("unexpected Content-Type %q. Expecting %q", h1.contentType, "application/octet-stream")
+	}
+}
+
+func TestRequestContentTypeNoDefault(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetMethod(MethodDelete)
+	h.SetHost("example.com")
+	h.SetNoDefaultContentType(true)
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := h.Write(bw); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var h1 RequestHeader
+	br := bufio.NewReader(w)
+	if err := h1.Read(br); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(h1.contentType) != 0 {
+		t.Fatalf("unexpected Content-Type %q. Expecting %q", h1.contentType, "")
+	}
+}
+
+func TestRequestWriteDeleteNoDefaultContentType(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.Header.SetMethod(MethodDelete)
+	req.Header.SetHost("example.com")
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := req.Write(bw); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var h RequestHeader
+	br := bufio.NewReader(w)
+	if err := h.Read(br); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(h.contentType) != 0 {
+		t.Fatalf("unexpected Content-Type %q. Expecting %q", h.contentType, "")
 	}
 }
 
@@ -1260,7 +2007,7 @@ func TestResponseDateNoDefaultNotEmpty(t *testing.T) {
 	headers := h.String()
 
 	if strings.Contains(headers, "\r\nDate: ") {
-		t.Fatalf("ResponseDateNoDefaultNotEmpty fail, response: \n%+v\noutcome: \n%q\n", h, headers) //nolint:govet
+		t.Fatalf("ResponseDateNoDefaultNotEmpty fail, response: \n%+v\noutcome: \n%q\n", &h, headers)
 	}
 }
 
@@ -1278,16 +2025,16 @@ func TestRequestHeaderConnectionClose(t *testing.T) {
 	var w bytes.Buffer
 	bw := bufio.NewWriter(&w)
 	if err := h.Write(bw); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var h1 RequestHeader
 	br := bufio.NewReader(&w)
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("error when reading request header: %s", err)
+		t.Fatalf("error when reading request header: %v", err)
 	}
 
 	if !h1.ConnectionClose() {
@@ -1296,7 +2043,6 @@ func TestRequestHeaderConnectionClose(t *testing.T) {
 	if string(h1.Peek(HeaderConnection)) != "close" {
 		t.Fatalf("unexpected connection value: %q. Expecting %q", h.Peek("Connection"), "close")
 	}
-
 }
 
 func TestRequestHeaderSetCookie(t *testing.T) {
@@ -1355,17 +2101,18 @@ func TestResponseHeaderVisitAll(t *testing.T) {
 
 	var h ResponseHeader
 
-	r := bytes.NewBufferString("HTTP/1.1 200 OK\r\nContent-Type: aa\r\nContent-Length: 123\r\nSet-Cookie: aa=bb; path=/foo/bar\r\nSet-Cookie: ccc\r\n\r\n")
+	r := bytes.NewBufferString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 123\r\nSet-Cookie: aa=bb; path=/foo/bar\r\nSet-Cookie: ccc\r\nTrailer: Foo, Bar\r\n\r\n")
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	if h.Len() != 4 {
-		t.Fatalf("Unexpected number of headers: %d. Expected 4", h.Len())
+	if h.Len() != 6 {
+		t.Fatalf("Unexpected number of headers: %d. Expected 6", h.Len())
 	}
 	contentLengthCount := 0
 	contentTypeCount := 0
+	contentEncodingCount := 0
 	cookieCount := 0
 	h.VisitAll(func(key, value []byte) {
 		k := string(key)
@@ -1381,6 +2128,11 @@ func TestResponseHeaderVisitAll(t *testing.T) {
 				t.Fatalf("Unexpected content-type: %q. Expected %q", v, h.Peek(k))
 			}
 			contentTypeCount++
+		case HeaderContentEncoding:
+			if v != string(h.Peek(k)) {
+				t.Fatalf("Unexpected content-encoding: %q. Expected %q", v, h.Peek(k))
+			}
+			contentEncodingCount++
 		case HeaderSetCookie:
 			if cookieCount == 0 && v != "aa=bb; path=/foo/bar" {
 				t.Fatalf("unexpected cookie header: %q. Expected %q", v, "aa=bb; path=/foo/bar")
@@ -1389,6 +2141,10 @@ func TestResponseHeaderVisitAll(t *testing.T) {
 				t.Fatalf("unexpected cookie header: %q. Expected %q", v, "ccc")
 			}
 			cookieCount++
+		case HeaderTrailer:
+			if v != "Foo, Bar" {
+				t.Fatalf("Unexpected trailer header %q. Expected %q", v, "Foo, Bar")
+			}
 		default:
 			t.Fatalf("unexpected header %q=%q", k, v)
 		}
@@ -1398,6 +2154,9 @@ func TestResponseHeaderVisitAll(t *testing.T) {
 	}
 	if contentTypeCount != 1 {
 		t.Fatalf("unexpected number of content-type headers: %d. Expected 1", contentTypeCount)
+	}
+	if contentEncodingCount != 1 {
+		t.Fatalf("unexpected number of content-encoding headers: %d. Expected 1", contentEncodingCount)
 	}
 	if cookieCount != 2 {
 		t.Fatalf("unexpected number of cookie header: %d. Expected 2", cookieCount)
@@ -1409,14 +2168,14 @@ func TestRequestHeaderVisitAll(t *testing.T) {
 
 	var h RequestHeader
 
-	r := bytes.NewBufferString("GET / HTTP/1.1\r\nHost: aa.com\r\nXX: YYY\r\nXX: ZZ\r\nCookie: a=b; c=d\r\n\r\n")
+	r := bytes.NewBufferString("GET / HTTP/1.1\r\nHost: aa.com\r\nXX: YYY\r\nXX: ZZ\r\nCookie: a=b; c=d\r\nTrailer: Foo, Bar\r\n\r\n")
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	if h.Len() != 4 {
-		t.Fatalf("Unexpected number of header: %d. Expected 4", h.Len())
+	if h.Len() != 5 {
+		t.Fatalf("Unexpected number of header: %d. Expected 5", h.Len())
 	}
 	hostCount := 0
 	xxCount := 0
@@ -1443,6 +2202,10 @@ func TestRequestHeaderVisitAll(t *testing.T) {
 				t.Fatalf("Unexpected cookie %q. Expected %q", v, "a=b; c=d")
 			}
 			cookieCount++
+		case HeaderTrailer:
+			if v != "Foo, Bar" {
+				t.Fatalf("Unexpected trailer header %q. Expected %q", v, "Foo, Bar")
+			}
 		default:
 			t.Fatalf("Unexpected header %q=%q", k, v)
 		}
@@ -1458,7 +2221,7 @@ func TestRequestHeaderVisitAll(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderVisitAllInOrder(t *testing.T) {
+func TestRequestHeaderVisitAllInOrder(t *testing.T) {
 	t.Parallel()
 
 	var h RequestHeader
@@ -1466,7 +2229,7 @@ func TestResponseHeaderVisitAllInOrder(t *testing.T) {
 	r := bytes.NewBufferString("GET / HTTP/1.1\r\nContent-Type: aa\r\nCookie: a=b\r\nHost: example.com\r\nUser-Agent: xxx\r\n\r\n")
 	br := bufio.NewReader(r)
 	if err := h.Read(br); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
 	if h.Len() != 4 {
@@ -1499,6 +2262,386 @@ func TestResponseHeaderVisitAllInOrder(t *testing.T) {
 		order = order[1:]
 		values = values[1:]
 	})
+}
+
+func TestResponseHeaderAddTrailerError(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	err := h.AddTrailer("Foo,   Content-Length , bAr,Transfer-Encoding, uSer aGent")
+	expectedTrailer := "Foo, Bar"
+
+	if !errors.Is(err, ErrBadTrailer) {
+		t.Fatalf("unexpected err %q. Expected %q", err, ErrBadTrailer)
+	}
+	if trailer := string(h.Peek(HeaderTrailer)); trailer != expectedTrailer {
+		t.Fatalf("unexpected trailer %q. Expected %q", trailer, expectedTrailer)
+	}
+}
+
+func TestRequestHeaderAddTrailerError(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	err := h.AddTrailer("Foo,   Content-Length , Bar,Transfer-Encoding,")
+	expectedTrailer := "Foo, Bar"
+
+	if !errors.Is(err, ErrBadTrailer) {
+		t.Fatalf("unexpected err %q. Expected %q", err, ErrBadTrailer)
+	}
+	if trailer := string(h.Peek(HeaderTrailer)); trailer != expectedTrailer {
+		t.Fatalf("unexpected trailer %q. Expected %q", trailer, expectedTrailer)
+	}
+}
+
+func TestResponseHeaderAddTrailerRejectsInvalidNames(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		trailer string
+	}{
+		{"crlf", "X-Ok\r\nInjected: yes"},
+		{"cr", "X-Ok\rInjected"},
+		{"lf", "X-Ok\nInjected"},
+		{"tab_inside", "X\tOk"},
+		{"space_inside", "X Ok"},
+		{"colon", "X-Ok: Injected"},
+		{"non_ascii", "X-\xff"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h ResponseHeader
+			h.noDefaultDate = true
+			err := h.AddTrailer(tc.trailer)
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("unexpected err %q. Expected %q", err, ErrBadTrailer)
+			}
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("unexpected trailer %q. Expected empty trailer", trailer)
+			}
+			if header := string(h.Header()); strings.Contains(header, "\r\nInjected") {
+				t.Fatalf("unexpected injected header in %q", header)
+			}
+		})
+	}
+}
+
+func TestRequestHeaderAddTrailerRejectsInvalidNames(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		trailer string
+	}{
+		{"crlf", "X-Ok\r\nInjected: yes"},
+		{"cr", "X-Ok\rInjected"},
+		{"lf", "X-Ok\nInjected"},
+		{"tab_inside", "X\tOk"},
+		{"space_inside", "X Ok"},
+		{"colon", "X-Ok: Injected"},
+		{"non_ascii", "X-\xff"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h RequestHeader
+			err := h.AddTrailer(tc.trailer)
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("unexpected err %q. Expected %q", err, ErrBadTrailer)
+			}
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("unexpected trailer %q. Expected empty trailer", trailer)
+			}
+			if header := string(h.Header()); strings.Contains(header, "\r\nInjected") {
+				t.Fatalf("unexpected injected header in %q", header)
+			}
+		})
+	}
+}
+
+func TestHeaderAddTrailerTrimsOWS(t *testing.T) {
+	t.Parallel()
+
+	t.Run("response header", func(t *testing.T) {
+		t.Parallel()
+
+		var h ResponseHeader
+		if err := h.AddTrailer("\tfoo\t, \tbar \t"); err != nil {
+			t.Fatalf("unexpected err %q", err)
+		}
+		if trailer := string(h.Peek(HeaderTrailer)); trailer != "Foo, Bar" {
+			t.Fatalf("unexpected trailer %q. Expected %q", trailer, "Foo, Bar")
+		}
+	})
+
+	t.Run("request header", func(t *testing.T) {
+		t.Parallel()
+
+		var h RequestHeader
+		if err := h.AddTrailer("\tfoo\t, \tbar \t"); err != nil {
+			t.Fatalf("unexpected err %q", err)
+		}
+		if trailer := string(h.Peek(HeaderTrailer)); trailer != "Foo, Bar" {
+			t.Fatalf("unexpected trailer %q. Expected %q", trailer, "Foo, Bar")
+		}
+	})
+}
+
+// Security tests for trailer handling vulnerability fix.
+func TestTrailerSecurityVulnerabilityFix(t *testing.T) {
+	t.Parallel()
+
+	// Test cases for headers that should be blocked in trailers
+	dangerousHeaders := []struct {
+		name        string
+		header      string
+		description string
+	}{
+		{"content-type", "Content-Type", "off-by-one fix: exactly 'Content-Type' should be blocked"},
+		{"cookie", "Cookie", "session hijacking prevention"},
+		{"set-cookie", "Set-Cookie", "session hijacking prevention"},
+		{"location", "Location", "redirect attack prevention"},
+		{"x-forwarded-for", "X-Forwarded-For", "IP spoofing prevention"},
+		{"x-forwarded-host", "X-Forwarded-Host", "IP spoofing prevention"},
+		{"x-forwarded-proto", "X-Forwarded-Proto", "IP spoofing prevention"},
+		{"x-real-ip", "X-Real-IP", "IP spoofing prevention"},
+		{"x-real-ip case insensitive", "X-Real-Ip", "IP spoofing prevention (case insensitive)"},
+		{"authorization", "Authorization", "auth bypass prevention"},
+		{"host", "Host", "host header attack prevention"},
+		{"connection", "Connection", "connection control prevention"},
+	}
+
+	// Test RequestHeader AddTrailer blocking dangerous headers.
+	for _, tc := range dangerousHeaders {
+		t.Run("request header/"+tc.name, func(t *testing.T) {
+			var h RequestHeader
+			err := h.AddTrailer(tc.header)
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("Expected ErrBadTrailer for %s (%s), got: %v", tc.header, tc.description, err)
+			}
+
+			// Verify trailer header is empty since the dangerous header was rejected
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("Expected empty trailer after rejecting %s, got: %q", tc.header, trailer)
+			}
+		})
+	}
+
+	// Test ResponseHeader AddTrailer blocking dangerous headers
+	for _, tc := range dangerousHeaders {
+		t.Run("response header/"+tc.name, func(t *testing.T) {
+			var h ResponseHeader
+			err := h.AddTrailer(tc.header)
+
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("Expected ErrBadTrailer for %s (%s), got: %v", tc.header, tc.description, err)
+			}
+
+			// Verify trailer header is empty since the dangerous header was rejected
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("Expected empty trailer after rejecting %s, got: %q", tc.header, trailer)
+			}
+		})
+	}
+
+	// Test that safe headers are still allowed
+	safeHeaders := []string{"Foo", "X-Custom-Safe", "My-App-Trailer", "Debug-Info"}
+
+	for _, header := range safeHeaders {
+		t.Run("safe request header/"+strings.ToLower(header), func(t *testing.T) {
+			var h RequestHeader
+			err := h.AddTrailer(header)
+			if err != nil {
+				t.Fatalf("Expected no error for safe header %s, got: %v", header, err)
+			}
+
+			// Verify the safe header was added to trailer
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != header {
+				t.Fatalf("Expected trailer %q for safe header, got: %q", header, trailer)
+			}
+		})
+
+		t.Run("safe response header/"+strings.ToLower(header), func(t *testing.T) {
+			var h ResponseHeader
+			err := h.AddTrailer(header)
+			if err != nil {
+				t.Fatalf("Expected no error for safe header %s, got: %v", header, err)
+			}
+
+			// Verify the safe header was added to trailer
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != header {
+				t.Fatalf("Expected trailer %q for safe header, got: %q", header, trailer)
+			}
+		})
+	}
+}
+
+func TestTrailerParsingSecurityFix(t *testing.T) {
+	t.Parallel()
+
+	// Test the specific vulnerability scenario: malicious trailers should be rejected
+	// Test that dangerous trailers in chunked body are properly blocked
+
+	dangerousTrailers := []string{
+		"Content-Type: text/malicious\r\n\r\n",
+		"X-Forwarded-For: attacker.com\r\n\r\n",
+		"X-Real-IP: 1.1.1.1\r\n\r\n",
+		"Cookie: evil\r\n\r\n",
+		"Location: http://evil.com\r\n\r\n",
+	}
+
+	for i, trailer := range dangerousTrailers {
+		t.Run("request/"+strconv.Itoa(i), func(t *testing.T) {
+			var h RequestHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err == nil {
+				t.Fatalf("Expected error when reading dangerous trailer, but got none: %s", trailer)
+			}
+
+			// The error should mention forbidden trailer
+			if !strings.Contains(err.Error(), "forbidden trailer") {
+				t.Fatalf("Expected 'forbidden trailer' error for %s, got: %v", trailer, err)
+			}
+		})
+
+		t.Run("response/"+strconv.Itoa(i), func(t *testing.T) {
+			var h ResponseHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err == nil {
+				t.Fatalf("Expected error when reading dangerous trailer, but got none: %s", trailer)
+			}
+
+			// The error should mention forbidden trailer
+			if !strings.Contains(err.Error(), "forbidden trailer") {
+				t.Fatalf("Expected 'forbidden trailer' error for %s, got: %v", trailer, err)
+			}
+		})
+	}
+
+	// Test that safe trailers still work
+	safeTrailers := []string{
+		"Foo: bar\r\n\r\n",
+		"X-Custom-Header: value\r\n\r\n",
+		"Debug-Info: test\r\n\r\n",
+	}
+
+	for i, trailer := range safeTrailers {
+		t.Run("safe request/"+strconv.Itoa(i), func(t *testing.T) {
+			var h RequestHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err != nil && err != io.EOF {
+				t.Fatalf("Expected no error for safe trailer %s, got: %v", trailer, err)
+			}
+		})
+
+		t.Run("safe response/"+strconv.Itoa(i), func(t *testing.T) {
+			var h ResponseHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err != nil && err != io.EOF {
+				t.Fatalf("Expected no error for safe trailer %s, got: %v", trailer, err)
+			}
+		})
+	}
+}
+
+func TestTrailerValueControlBytesRejected(t *testing.T) {
+	t.Parallel()
+
+	// Trailer values carrying control bytes must be rejected, matching the
+	// validation the regular header parsers apply to header values. Without
+	// this an undeclared trailer is merged into the header set and re-emitted
+	// verbatim, so a bare CR slips into the serialised header block.
+	badTrailers := []string{
+		"X-Foo: a\rb\r\n\r\n",
+		"X-Foo: a\x00b\r\n\r\n",
+		"X-Foo: a\x01b\r\n\r\n",
+	}
+
+	for i, trailer := range badTrailers {
+		t.Run("request/"+strconv.Itoa(i), func(t *testing.T) {
+			var h RequestHeader
+			err := h.ReadTrailer(bufio.NewReader(bytes.NewBufferString(trailer)))
+			if err == nil {
+				t.Fatalf("expected error for trailer value with control byte: %q", trailer)
+			}
+			if !strings.Contains(err.Error(), "invalid trailer value") {
+				t.Fatalf("expected 'invalid trailer value' error for %q, got: %v", trailer, err)
+			}
+		})
+
+		t.Run("response/"+strconv.Itoa(i), func(t *testing.T) {
+			var h ResponseHeader
+			err := h.ReadTrailer(bufio.NewReader(bytes.NewBufferString(trailer)))
+			if err == nil {
+				t.Fatalf("expected error for trailer value with control byte: %q", trailer)
+			}
+			if !strings.Contains(err.Error(), "invalid trailer value") {
+				t.Fatalf("expected 'invalid trailer value' error for %q, got: %v", trailer, err)
+			}
+		})
+	}
+
+	// A normal trailer value is still accepted.
+	var h RequestHeader
+	if err := h.ReadTrailer(bufio.NewReader(bytes.NewBufferString("X-Foo: bar\r\n\r\n"))); err != nil && err != io.EOF {
+		t.Fatalf("unexpected error for safe trailer value: %v", err)
+	}
+}
+
+func TestSkipCleanWords(t *testing.T) {
+	t.Parallel()
+
+	isCTL := func(c byte) bool { return c < 0x20 || c == 0x7f }
+	for n := 0; n <= 24; n++ {
+		for c := range 256 {
+			for pos := 0; pos < n; pos++ {
+				b := bytes.Repeat([]byte{'a'}, n)
+				b[pos] = byte(c)
+				rest := skipCleanWords(b)
+				skipped := len(b) - len(rest)
+				if skipped%8 != 0 || !bytes.Equal(rest, b[skipped:]) {
+					t.Fatalf("byte %#x at %d of %d: skipped %d bytes, rest %q", c, pos, n, skipped, rest)
+				}
+				for _, ch := range b[:skipped] {
+					if isCTL(ch) {
+						t.Fatalf("byte %#x at %d of %d: skipped a control byte", c, pos, n)
+					}
+				}
+				if len(rest) >= 8 {
+					clean := true
+					for _, ch := range rest[:8] {
+						if isCTL(ch) {
+							clean = false
+						}
+					}
+					if clean {
+						t.Fatalf("byte %#x at %d of %d: stopped at a clean word", c, pos, n)
+					}
+				}
+			}
+		}
+	}
+	if rest := skipCleanWords(nil); len(rest) != 0 {
+		t.Fatalf("unexpected rest for nil: %q", rest)
+	}
 }
 
 func TestResponseHeaderCookie(t *testing.T) {
@@ -1541,7 +2684,7 @@ func TestResponseHeaderCookie(t *testing.T) {
 		t.Fatalf("unexpected cookie\n%v\nExpected\n%v\n", &c, &expectedC2)
 	}
 
-	h.VisitAllCookie(func(key, value []byte) {
+	for key, value := range h.Cookies() {
 		var cc Cookie
 		if err := cc.ParseBytes(value); err != nil {
 			t.Fatal(err)
@@ -1561,15 +2704,15 @@ func TestResponseHeaderCookie(t *testing.T) {
 		default:
 			t.Fatalf("unexpected cookie key %q", key)
 		}
-	})
+	}
 
 	w := &bytes.Buffer{}
 	bw := bufio.NewWriter(w)
 	if err := h.Write(bw); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	h.DelAllCookies()
@@ -1577,7 +2720,7 @@ func TestResponseHeaderCookie(t *testing.T) {
 	var h1 ResponseHeader
 	br := bufio.NewReader(w)
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	c.SetKey("foobar")
@@ -1643,7 +2786,7 @@ func TestRequestHeaderCookie(t *testing.T) {
 	h.SetCookie("привет", "мир")
 
 	if string(h.Cookie("foo")) != "bar" {
-		t.Fatalf("Unexpected cookie value %q. Exepcted %q", h.Cookie("foo"), "bar")
+		t.Fatalf("Unexpected cookie value %q. Expected %q", h.Cookie("foo"), "bar")
 	}
 	if string(h.Cookie("привет")) != "мир" {
 		t.Fatalf("Unexpected cookie value %q. Expected %q", h.Cookie("привет"), "мир")
@@ -1652,20 +2795,20 @@ func TestRequestHeaderCookie(t *testing.T) {
 	w := &bytes.Buffer{}
 	bw := bufio.NewWriter(w)
 	if err := h.Write(bw); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
 	var h1 RequestHeader
 	br := bufio.NewReader(w)
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("Unexpected error: %s", err)
+		t.Fatalf("Unexpected error: %v", err)
 	}
 
 	if !bytes.Equal(h1.Cookie("foo"), h.Cookie("foo")) {
-		t.Fatalf("Unexpected cookie value %q. Exepcted %q", h1.Cookie("foo"), h.Cookie("foo"))
+		t.Fatalf("Unexpected cookie value %q. Expected %q", h1.Cookie("foo"), h.Cookie("foo"))
 	}
 	h1.DelCookie("foo")
 	if len(h1.Cookie("foo")) > 0 {
@@ -1688,6 +2831,104 @@ func TestRequestHeaderCookie(t *testing.T) {
 	}
 }
 
+func TestRequestHeaderSetCookieSanitizesNewLines(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetRequestURI("/")
+	h.SetHost("example.com")
+	h.SetCookie("sid\r\nX-Injected-Key: 1", "abc\r\nX-Injected-Value: 1")
+
+	header := string(h.Header())
+	if strings.Contains(header, "\r\nX-Injected") {
+		t.Fatalf("unexpected injected header in %q", header)
+	}
+	if n := strings.Count(header, "\r\nCookie: "); n != 1 {
+		t.Fatalf("unexpected Cookie header count %d in %q", n, header)
+	}
+}
+
+func TestRequestHeaderSetCookieSanitizesSemicolons(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetRequestURI("/")
+	h.SetHost("example.com")
+	h.SetCookie("sid", "abc; admin=1")
+
+	header := string(h.Header())
+	if n := strings.Count(header, ";"); n != 0 {
+		t.Fatalf("unexpected %d cookie separators in %q", n, header)
+	}
+
+	var h1 RequestHeader
+	if err := h1.Read(bufio.NewReader(strings.NewReader(header))); err != nil {
+		t.Fatal(err)
+	}
+	if v := string(h1.Cookie("admin")); v != "" {
+		t.Fatalf("unexpected injected cookie admin=%q in %q", v, header)
+	}
+
+	var h2 RequestHeader
+	h2.SetRequestURI("/")
+	h2.SetHost("example.com")
+	h2.SetCookie("sid; admin=1", "abc")
+
+	header2 := string(h2.Header())
+	if n := strings.Count(header2, ";"); n != 0 {
+		t.Fatalf("unexpected %d cookie separators in %q", n, header2)
+	}
+
+	var h3 RequestHeader
+	if err := h3.Read(bufio.NewReader(strings.NewReader(header2))); err != nil {
+		t.Fatal(err)
+	}
+	if v := string(h3.Cookie("admin")); v != "" {
+		t.Fatalf("unexpected injected cookie admin=%q in %q", v, header2)
+	}
+}
+
+func TestResponseHeaderSetCookieSanitizesNewLines(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	c.SetKey("sid")
+	c.SetValue("abc\r\nSet-Cookie: admin=1; Path=/; HttpOnly")
+
+	var h ResponseHeader
+	h.SetStatusCode(StatusOK)
+	h.SetCookie(&c)
+
+	header := string(h.Header())
+	if strings.Contains(header, "\r\nSet-Cookie: admin=1") {
+		t.Fatalf("unexpected injected Set-Cookie header in %q", header)
+	}
+	if n := strings.Count(header, "\r\nSet-Cookie: "); n != 1 {
+		t.Fatalf("unexpected Set-Cookie header count %d in %q", n, header)
+	}
+}
+
+func TestResponseHeaderSetParsedCookieSanitizesNewLines(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	err := c.Parse("sid=abc\r\nSet-Cookie: admin=1; Path=/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var h ResponseHeader
+	h.SetCookie(&c)
+
+	header := string(h.Header())
+	if strings.Contains(header, "\r\nSet-Cookie: admin=1") {
+		t.Fatalf("unexpected injected Set-Cookie header in %q", header)
+	}
+	if n := strings.Count(header, "\r\nSet-Cookie: "); n != 1 {
+		t.Fatalf("unexpected Set-Cookie header count %d in %q", n, header)
+	}
+}
+
 func TestResponseHeaderCookieIssue4(t *testing.T) {
 	t.Parallel()
 
@@ -1702,12 +2943,12 @@ func TestResponseHeaderCookieIssue4(t *testing.T) {
 		t.Fatalf("Unexpected Set-Cookie header %q. Expected %q", h.Peek(HeaderSetCookie), "foo=bar")
 	}
 	cookieSeen := false
-	h.VisitAll(func(key, value []byte) {
-		switch string(key) {
-		case HeaderSetCookie:
+	for key := range h.All() {
+		if string(key) == HeaderSetCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Set-Cookie not present in VisitAll")
 	}
@@ -1716,21 +2957,59 @@ func TestResponseHeaderCookieIssue4(t *testing.T) {
 	c.SetKey("foo")
 	h.Cookie(c)
 	if string(c.Value()) != "bar" {
-		t.Fatalf("Unexpected cookie value %q. Exepcted %q", c.Value(), "bar")
+		t.Fatalf("Unexpected cookie value %q. Expected %q", c.Value(), "bar")
 	}
 
 	if string(h.Peek(HeaderSetCookie)) != "foo=bar" {
 		t.Fatalf("Unexpected Set-Cookie header %q. Expected %q", h.Peek(HeaderSetCookie), "foo=bar")
 	}
 	cookieSeen = false
-	h.VisitAll(func(key, value []byte) {
-		switch string(key) {
-		case HeaderSetCookie:
+	for key := range h.All() {
+		if string(key) == HeaderSetCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Set-Cookie not present in VisitAll")
+	}
+}
+
+func TestResponseHeaderCookieWithoutEquals(t *testing.T) {
+	t.Parallel()
+
+	var parsed ResponseHeader
+	r := bufio.NewReader(strings.NewReader("HTTP/1.1 200 OK\r\nSet-Cookie: sid; Path=/\r\n\r\n"))
+	if err := parsed.Read(r); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var set ResponseHeader
+	set.Set(HeaderSetCookie, "sid; Path=/")
+
+	for _, tc := range []struct {
+		h    *ResponseHeader
+		name string
+	}{{&parsed, "parsed"}, {&set, "set"}} {
+		name, h := tc.name, tc.h
+		// The cookie must be stored under the same key Cookie.ParseBytes
+		// gives it, so it can be looked up again.
+		for key, value := range h.Cookies() {
+			var c Cookie
+			if err := c.ParseBytes(value); err != nil {
+				t.Fatalf("%s: unexpected error: %v", name, err)
+			}
+			if !bytes.Equal(key, c.Key()) {
+				t.Errorf("%s: cookie stored under %q, but its key is %q", name, key, c.Key())
+			}
+		}
+
+		var c Cookie
+		if !h.Cookie(&c) {
+			t.Errorf("%s: cookie without a name not found", name)
+		} else if string(c.Value()) != "sid" || string(c.Path()) != "/" {
+			t.Errorf("%s: unexpected cookie %q", name, c.Cookie())
+		}
 	}
 }
 
@@ -1747,30 +3026,30 @@ func TestRequestHeaderCookieIssue313(t *testing.T) {
 		t.Fatalf("Unexpected Cookie header %q. Expected %q", h.Peek(HeaderCookie), "foo=bar")
 	}
 	cookieSeen := false
-	h.VisitAll(func(key, value []byte) {
-		switch string(key) {
-		case HeaderCookie:
+	for key := range h.All() {
+		if string(key) == HeaderCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Cookie not present in VisitAll")
 	}
 
 	if string(h.Cookie("foo")) != "bar" {
-		t.Fatalf("Unexpected cookie value %q. Exepcted %q", h.Cookie("foo"), "bar")
+		t.Fatalf("Unexpected cookie value %q. Expected %q", h.Cookie("foo"), "bar")
 	}
 
 	if string(h.Peek(HeaderCookie)) != "foo=bar" {
 		t.Fatalf("Unexpected Cookie header %q. Expected %q", h.Peek(HeaderCookie), "foo=bar")
 	}
 	cookieSeen = false
-	h.VisitAll(func(key, value []byte) {
-		switch string(key) {
-		case HeaderCookie:
+	for key := range h.All() {
+		if string(key) == HeaderCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Cookie not present in VisitAll")
 	}
@@ -1790,9 +3069,126 @@ func TestRequestHeaderMethod(t *testing.T) {
 	testRequestHeaderMethod(t, "ABC")
 }
 
+func TestRequestHeaderFirstLineSettersSanitizeNewlines(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name              string
+		set               func(*RequestHeader)
+		value             func(*RequestHeader) []byte
+		expectedValue     string
+		expectedFirstLine string
+		expectedNoHTTP11  bool
+	}{
+		{
+			name: "set method",
+			set: func(h *RequestHeader) {
+				h.SetMethod("GET\r\nInjected-Method: true")
+			},
+			value:             func(h *RequestHeader) []byte { return h.Method() },
+			expectedValue:     "GET  Injected-Method: true",
+			expectedFirstLine: "GET  Injected-Method: true / HTTP/1.1",
+		},
+		{
+			name: "set method bytes",
+			set: func(h *RequestHeader) {
+				h.SetMethodBytes([]byte("GET\r\nInjected-Method-Bytes: true"))
+			},
+			value:             func(h *RequestHeader) []byte { return h.Method() },
+			expectedValue:     "GET  Injected-Method-Bytes: true",
+			expectedFirstLine: "GET  Injected-Method-Bytes: true / HTTP/1.1",
+		},
+		{
+			name: "set request uri",
+			set: func(h *RequestHeader) {
+				h.SetRequestURI("/\r\nInjected-URI: true")
+			},
+			value:             func(h *RequestHeader) []byte { return h.RequestURI() },
+			expectedValue:     "/  Injected-URI: true",
+			expectedFirstLine: "GET /  Injected-URI: true HTTP/1.1",
+		},
+		{
+			name: "set request uri bytes",
+			set: func(h *RequestHeader) {
+				h.SetRequestURIBytes([]byte("/\r\nInjected-URI-Bytes: true"))
+			},
+			value:             func(h *RequestHeader) []byte { return h.RequestURI() },
+			expectedValue:     "/  Injected-URI-Bytes: true",
+			expectedFirstLine: "GET /  Injected-URI-Bytes: true HTTP/1.1",
+		},
+		{
+			name: "set protocol",
+			set: func(h *RequestHeader) {
+				h.SetProtocol("HTTP/1.1\r\nInjected-Protocol: true")
+			},
+			value:             func(h *RequestHeader) []byte { return h.Protocol() },
+			expectedValue:     "HTTP/1.1  Injected-Protocol: true",
+			expectedFirstLine: "GET / HTTP/1.1  Injected-Protocol: true",
+			expectedNoHTTP11:  true,
+		},
+		{
+			name: "set protocol bytes",
+			set: func(h *RequestHeader) {
+				h.SetProtocolBytes([]byte("HTTP/1.1\r\nInjected-Protocol-Bytes: true"))
+			},
+			value:             func(h *RequestHeader) []byte { return h.Protocol() },
+			expectedValue:     "HTTP/1.1  Injected-Protocol-Bytes: true",
+			expectedFirstLine: "GET / HTTP/1.1  Injected-Protocol-Bytes: true",
+			expectedNoHTTP11:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var h RequestHeader
+			h.SetMethod(MethodGet)
+			h.SetRequestURI("/")
+			h.SetProtocol("HTTP/1.1")
+			h.SetHost("example.com")
+
+			tc.set(&h)
+
+			if got := string(tc.value(&h)); got != tc.expectedValue {
+				t.Fatalf("unexpected sanitized value: %q. Expected %q", got, tc.expectedValue)
+			}
+
+			firstLine, _, ok := bytes.Cut(h.Header(), strCRLF)
+			if !ok {
+				t.Fatalf("missing request first line terminator in header %q", h.Header())
+			}
+			if got := string(firstLine); got != tc.expectedFirstLine {
+				t.Fatalf("unexpected request first line: %q. Expected %q", got, tc.expectedFirstLine)
+			}
+			if bytes.Contains(h.Header(), []byte("\r\nInjected-")) {
+				t.Fatalf("unexpected injected header line in %q", h.Header())
+			}
+			if h.noHTTP11 != tc.expectedNoHTTP11 {
+				t.Fatalf("unexpected noHTTP11 flag: %v. Expected %v", h.noHTTP11, tc.expectedNoHTTP11)
+			}
+		})
+	}
+}
+
+func TestRequestHeaderSetProtocolKeepsHTTP11FlagForSanitizedHTTP11(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetProtocolBytes([]byte("HTTP/1.1"))
+
+	if h.noHTTP11 {
+		t.Fatalf("expected noHTTP11 to remain false for HTTP/1.1")
+	}
+	if got := string(h.Protocol()); got != "HTTP/1.1" {
+		t.Fatalf("unexpected protocol: %q. Expected %q", got, "HTTP/1.1")
+	}
+}
+
 func testRequestHeaderMethod(t *testing.T, expectedMethod string) {
 	var h RequestHeader
 	h.SetMethod(expectedMethod)
+	h.SetHost("example.com")
 	m := h.Method()
 	if string(m) != expectedMethod {
 		t.Fatalf("unexpected method: %q. Expecting %q", m, expectedMethod)
@@ -1802,10 +3198,10 @@ func testRequestHeaderMethod(t *testing.T, expectedMethod string) {
 	var h1 RequestHeader
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := h1.Read(br); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	m1 := h1.Method()
-	if string(m) != string(m1) {
+	if !bytes.Equal(m, m1) {
 		t.Fatalf("unexpected method: %q. Expecting %q", m, m1)
 	}
 }
@@ -1847,16 +3243,16 @@ func TestRequestHeaderSetGet(t *testing.T) {
 	bw := bufio.NewWriter(w)
 	err := h.Write(bw)
 	if err != nil {
-		t.Fatalf("Unexpected error when writing request header: %s", err)
+		t.Fatalf("Unexpected error when writing request header: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("Unexpected error when flushing request header: %s", err)
+		t.Fatalf("Unexpected error when flushing request header: %v", err)
 	}
 
 	var h1 RequestHeader
 	br := bufio.NewReader(w)
 	if err = h1.Read(br); err != nil {
-		t.Fatalf("Unexpected error when reading request header: %s", err)
+		t.Fatalf("Unexpected error when reading request header: %v", err)
 	}
 
 	if h1.ContentLength() != h.ContentLength() {
@@ -1878,9 +3274,12 @@ func TestRequestHeaderSetGet(t *testing.T) {
 }
 
 func TestResponseHeaderSetGet(t *testing.T) {
+	t.Parallel()
+
 	h := &ResponseHeader{}
 	h.Set("foo", "bar")
 	h.Set("content-type", "aaa/bbb")
+	h.Set("content-encoding", "gzip")
 	h.Set("connection", "close")
 	h.Set("content-length", "1234")
 	h.Set(HeaderServer, "aaaa")
@@ -1889,6 +3288,7 @@ func TestResponseHeaderSetGet(t *testing.T) {
 
 	expectResponseHeaderGet(t, h, "Foo", "bar")
 	expectResponseHeaderGet(t, h, HeaderContentType, "aaa/bbb")
+	expectResponseHeaderGet(t, h, HeaderContentEncoding, "gzip")
 	expectResponseHeaderGet(t, h, HeaderConnection, "close")
 	expectResponseHeaderGet(t, h, HeaderContentLength, "1234")
 	expectResponseHeaderGet(t, h, "seRVer", "aaaa")
@@ -1906,16 +3306,16 @@ func TestResponseHeaderSetGet(t *testing.T) {
 	bw := bufio.NewWriter(w)
 	err := h.Write(bw)
 	if err != nil {
-		t.Fatalf("Unexpected error when writing response header: %s", err)
+		t.Fatalf("Unexpected error when writing response header: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("Unexpected error when flushing response header: %s", err)
+		t.Fatalf("Unexpected error when flushing response header: %v", err)
 	}
 
 	var h1 ResponseHeader
 	br := bufio.NewReader(w)
 	if err = h1.Read(br); err != nil {
-		t.Fatalf("Unexpected error when reading response header: %s", err)
+		t.Fatalf("Unexpected error when reading response header: %v", err)
 	}
 
 	if h1.ContentLength() != h.ContentLength() {
@@ -1927,6 +3327,7 @@ func TestResponseHeaderSetGet(t *testing.T) {
 
 	expectResponseHeaderGet(t, &h1, "Foo", "bar")
 	expectResponseHeaderGet(t, &h1, HeaderContentType, "aaa/bbb")
+	expectResponseHeaderGet(t, &h1, HeaderContentEncoding, "gzip")
 	expectResponseHeaderGet(t, &h1, HeaderConnection, "close")
 	expectResponseHeaderGet(t, &h1, "seRVer", "aaaa")
 	expectResponseHeaderGet(t, &h1, "baz", "xxxxx")
@@ -1962,21 +3363,398 @@ func testResponseHeaderConnectionClose(t *testing.T, connectionClose bool) {
 	bw := bufio.NewWriter(w)
 	err := h.Write(bw)
 	if err != nil {
-		t.Fatalf("Unexpected error when writing response header: %s", err)
+		t.Fatalf("Unexpected error when writing response header: %v", err)
 	}
 	if err := bw.Flush(); err != nil {
-		t.Fatalf("Unexpected error when flushing response header: %s", err)
+		t.Fatalf("Unexpected error when flushing response header: %v", err)
 	}
 
 	var h1 ResponseHeader
 	br := bufio.NewReader(w)
 	err = h1.Read(br)
 	if err != nil {
-		t.Fatalf("Unexpected error when reading response header: %s", err)
+		t.Fatalf("Unexpected error when reading response header: %v", err)
 	}
 	if h1.ConnectionClose() != h.ConnectionClose() {
 		t.Fatalf("Unexpected value for ConnectionClose: %v. Expected %v", h1.ConnectionClose(), h.ConnectionClose())
 	}
+}
+
+func TestHeaderConnectionCloseVariants(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		header string
+		want   bool
+	}{
+		{"close", true},
+		{"Close", true},
+		{"CLOSE", true},
+		{"\tclose\t", true},
+		{" \tClose\t ", true},
+		{"TE, close", true},
+		{"close, TE", true},
+		{"TE,\tclose", true},
+		{"close\t, TE", true},
+		{"\tTE\t,\tclose\t", true},
+		{"X-Hop, close", true},
+		{"close, X-Hop", true},
+		{"keep-alive", false},
+		{"keep-alive, TE", false},
+		{"keep-alive,\tTE", false},
+	}
+
+	for _, tc := range cases {
+		t.Run("reqRead/"+tc.header, func(t *testing.T) {
+			raw := "GET / HTTP/1.1\r\nHost: h\r\nConnection: " + tc.header + "\r\n\r\n"
+			var req Request
+			if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := req.ConnectionClose(); got != tc.want {
+				t.Errorf("req.ConnectionClose() for %q = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+
+		t.Run("respRead/"+tc.header, func(t *testing.T) {
+			respRaw := "HTTP/1.1 200 OK\r\nConnection: " + tc.header + "\r\nContent-Length: 0\r\n\r\n"
+			var resp Response
+			if err := resp.Read(bufio.NewReader(strings.NewReader(respRaw))); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := resp.ConnectionClose(); got != tc.want {
+				t.Errorf("resp.ConnectionClose() for %q = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+
+		t.Run("reqSet/"+tc.header, func(t *testing.T) {
+			var req Request
+			req.Header.Set("Connection", tc.header)
+			if got := req.ConnectionClose(); got != tc.want {
+				t.Errorf("req.Header.Set ConnectionClose() for %q = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+
+		t.Run("respSet/"+tc.header, func(t *testing.T) {
+			var resp Response
+			resp.Header.Set("Connection", tc.header)
+			if got := resp.ConnectionClose(); got != tc.want {
+				t.Errorf("resp.Header.Set ConnectionClose() for %q = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHeaderConnectionPreserveOptions(t *testing.T) {
+	t.Parallel()
+
+	testOptionPreserved := func(t *testing.T, target string, getConn func() []byte, getHeader func() string, visit func(f func(k, v []byte))) {
+		conn := getConn()
+		if !hasHeaderValue(conn, []byte("X-Hop")) {
+			t.Fatalf("%s: expected Connection header to contain X-Hop, got %q", target, conn)
+		}
+		if !hasHeaderValue(conn, strClose) {
+			t.Fatalf("%s: expected Connection header to contain close, got %q", target, conn)
+		}
+
+		rawHeader := getHeader()
+		if !strings.Contains(rawHeader, "X-Hop") {
+			t.Fatalf("%s: serialized header missing X-Hop: %q", target, rawHeader)
+		}
+		if strings.Count(rawHeader, "Connection:") != 1 {
+			t.Fatalf("%s: expected exactly 1 Connection header in serialized output, got: %q", target, rawHeader)
+		}
+
+		connVisitCount := 0
+		visit(func(k, v []byte) {
+			if caseInsensitiveCompare(k, strConnection) {
+				connVisitCount++
+				if !hasHeaderValue(v, []byte("X-Hop")) {
+					t.Errorf("%s: visited Connection header missing X-Hop: %q", target, v)
+				}
+			}
+		})
+		if connVisitCount != 1 {
+			t.Fatalf("%s: expected exactly 1 Connection header visited, got %d", target, connVisitCount)
+		}
+	}
+
+	t.Run("reqRead", func(t *testing.T) {
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nConnection: X-Hop, close\r\nX-Hop: secret\r\n\r\n"
+		var req Request
+		if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !req.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true")
+		}
+		if string(req.Header.Peek("X-Hop")) != "secret" {
+			t.Fatalf("expected X-Hop header to be preserved, got %q", req.Header.Peek("X-Hop"))
+		}
+		testOptionPreserved(t, "reqRead",
+			func() []byte { return req.Header.Peek("Connection") },
+			func() string { return string(req.Header.Header()) },
+			req.Header.VisitAll,
+		)
+	})
+
+	t.Run("respRead", func(t *testing.T) {
+		raw := "HTTP/1.1 200 OK\r\nConnection: X-Hop, close\r\nContent-Length: 0\r\n\r\n"
+		var resp Response
+		if err := resp.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true")
+		}
+		testOptionPreserved(t, "respRead",
+			func() []byte { return resp.Header.Peek("Connection") },
+			func() string { return string(resp.Header.Header()) },
+			resp.Header.VisitAll,
+		)
+	})
+
+	t.Run("reqSet", func(t *testing.T) {
+		var req Request
+		req.Header.Set("Connection", "X-Hop, close")
+		if !req.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true")
+		}
+		testOptionPreserved(t, "reqSet",
+			func() []byte { return req.Header.Peek("Connection") },
+			func() string { return string(req.Header.Header()) },
+			req.Header.VisitAll,
+		)
+	})
+
+	t.Run("respSet", func(t *testing.T) {
+		var resp Response
+		resp.Header.Set("Connection", "X-Hop, close")
+		if !resp.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true")
+		}
+		testOptionPreserved(t, "respSet",
+			func() []byte { return resp.Header.Peek("Connection") },
+			func() string { return string(resp.Header.Header()) },
+			resp.Header.VisitAll,
+		)
+	})
+
+	t.Run("tabsParsingAndSet", func(t *testing.T) {
+		tabInputs := []string{"TE,\tclose", "close\t, TE", "foo,\tClose\t, bar"}
+		for _, in := range tabInputs {
+			var req Request
+			raw := "GET / HTTP/1.1\r\nHost: h\r\nConnection: " + in + "\r\n\r\n"
+			if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !req.ConnectionClose() {
+				t.Errorf("reqRead: expected ConnectionClose() for %q to be true", in)
+			}
+			if !hasHeaderValue(req.Header.Peek("Connection"), strClose) {
+				t.Errorf("reqRead: expected Peek(Connection) to have close for %q", in)
+			}
+
+			var resp Response
+			resp.Header.Set("Connection", in)
+			if !resp.ConnectionClose() {
+				t.Errorf("respSet: expected ConnectionClose() for %q to be true", in)
+			}
+			if !hasHeaderValue(resp.Header.Peek("Connection"), strClose) {
+				t.Errorf("respSet: expected Peek(Connection) to have close for %q", in)
+			}
+		}
+	})
+
+	t.Run("reqResetPreservesOtherOptions", func(t *testing.T) {
+		// After read/parsing
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nConnection: X-Hop, close\r\nX-Hop: secret\r\n\r\n"
+		var req Request
+		if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !req.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true before reset")
+		}
+		req.Header.ResetConnectionClose()
+		if req.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be false after reset")
+		}
+		conn := req.Header.Peek("Connection")
+		if !hasHeaderValue(conn, []byte("X-Hop")) {
+			t.Fatalf("expected Connection header to keep X-Hop after reset, got %q", conn)
+		}
+		if hasHeaderValue(conn, strClose) {
+			t.Fatalf("expected close option to be removed from Connection header, got %q", conn)
+		}
+		if string(req.Header.Peek("X-Hop")) != "secret" {
+			t.Fatalf("expected X-Hop header to be preserved, got %q", req.Header.Peek("X-Hop"))
+		}
+		hdr := string(req.Header.Header())
+		if !strings.Contains(hdr, "Connection: X-Hop") {
+			t.Fatalf("expected serialized header to have 'Connection: X-Hop', got %q", hdr)
+		}
+		if strings.Contains(hdr, "close") {
+			t.Fatalf("expected serialized header to not contain 'close', got %q", hdr)
+		}
+
+		// After Set
+		var req2 Request
+		req2.Header.Set("Connection", "close, X-Hop")
+		req2.Header.Set("X-Hop", "secret")
+		if !req2.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true before reset")
+		}
+		req2.Header.ResetConnectionClose()
+		if req2.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be false after reset")
+		}
+		conn2 := req2.Header.Peek("Connection")
+		if !hasHeaderValue(conn2, []byte("X-Hop")) {
+			t.Fatalf("expected Connection header to keep X-Hop after reset, got %q", conn2)
+		}
+		if hasHeaderValue(conn2, strClose) {
+			t.Fatalf("expected close option to be removed from Connection header, got %q", conn2)
+		}
+		hdr2 := string(req2.Header.Header())
+		if !strings.Contains(hdr2, "Connection: X-Hop") {
+			t.Fatalf("expected serialized header to have 'Connection: X-Hop', got %q", hdr2)
+		}
+	})
+
+	t.Run("respResetPreservesOtherOptions", func(t *testing.T) {
+		// After read/parsing
+		raw := "HTTP/1.1 200 OK\r\nConnection: foo, close, bar\r\nContent-Length: 0\r\n\r\n"
+		var resp Response
+		if err := resp.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true before reset")
+		}
+		resp.Header.ResetConnectionClose()
+		if resp.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be false after reset")
+		}
+		conn := resp.Header.Peek("Connection")
+		if !hasHeaderValue(conn, []byte("foo")) || !hasHeaderValue(conn, []byte("bar")) {
+			t.Fatalf("expected Connection header to keep foo and bar after reset, got %q", conn)
+		}
+		if hasHeaderValue(conn, strClose) {
+			t.Fatalf("expected close option to be removed from Connection header, got %q", conn)
+		}
+		hdr := string(resp.Header.Header())
+		if !strings.Contains(hdr, "Connection: foo, bar") {
+			t.Fatalf("expected serialized header to have 'Connection: foo, bar', got %q", hdr)
+		}
+
+		// After Set
+		var resp2 Response
+		resp2.Header.Set("Connection", "X-Hop, close")
+		if !resp2.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be true before reset")
+		}
+		resp2.Header.ResetConnectionClose()
+		if resp2.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be false after reset")
+		}
+		conn2 := resp2.Header.Peek("Connection")
+		if !hasHeaderValue(conn2, []byte("X-Hop")) {
+			t.Fatalf("expected Connection header to keep X-Hop after reset, got %q", conn2)
+		}
+		if hasHeaderValue(conn2, strClose) {
+			t.Fatalf("expected close option to be removed from Connection header, got %q", conn2)
+		}
+	})
+
+	t.Run("resetOnlyCloseDeletesHeader", func(t *testing.T) {
+		var req Request
+		req.Header.Set("Connection", "close")
+		req.Header.ResetConnectionClose()
+		if req.ConnectionClose() {
+			t.Fatalf("expected ConnectionClose() to be false")
+		}
+		if len(req.Header.Peek("Connection")) > 0 {
+			t.Fatalf("expected Connection header to be deleted when only close was present, got %q", req.Header.Peek("Connection"))
+		}
+	})
+
+	t.Run("setConnectionOverwritesPreservingValue", func(t *testing.T) {
+		var req Request
+		req.Header.Set("Connection", "X-Hop, close")
+		req.Header.Set("Connection", "keep-alive")
+		if got := string(req.Header.Peek("Connection")); got != "keep-alive" {
+			t.Fatalf("expected request Connection: keep-alive, got %q", got)
+		}
+		if req.ConnectionClose() {
+			t.Fatalf("expected request ConnectionClose() to be false")
+		}
+
+		var resp Response
+		resp.Header.Set("Connection", "X-Hop, close")
+		resp.Header.Set("Connection", "keep-alive")
+		if got := string(resp.Header.Peek("Connection")); got != "keep-alive" {
+			t.Fatalf("expected response Connection: keep-alive, got %q", got)
+		}
+		if resp.ConnectionClose() {
+			t.Fatalf("expected response ConnectionClose() to be false")
+		}
+	})
+
+	t.Run("addHeaderAfterResetPreservesDistinctBuffers", func(t *testing.T) {
+		// Request
+		var req Request
+		req.Header.Set("Connection", "")
+		req.Header.Set("X-Test", "original")
+		req.Header.SetConnectionClose()
+		req.Header.ResetConnectionClose()
+		req.Header.Set("X-New", "changed")
+		if got := string(req.Header.Peek("X-Test")); got != "original" {
+			t.Fatalf("expected request X-Test: original, got %q", got)
+		}
+		if got := string(req.Header.Peek("X-New")); got != "changed" {
+			t.Fatalf("expected request X-New: changed, got %q", got)
+		}
+
+		// Response
+		var resp Response
+		resp.Header.Set("Connection", "")
+		resp.Header.Set("X-Test", "original")
+		resp.Header.SetConnectionClose()
+		resp.Header.ResetConnectionClose()
+		resp.Header.Set("X-New", "changed")
+		if got := string(resp.Header.Peek("X-Test")); got != "original" {
+			t.Fatalf("expected response X-Test: original, got %q", got)
+		}
+		if got := string(resp.Header.Peek("X-New")); got != "changed" {
+			t.Fatalf("expected response X-New: changed, got %q", got)
+		}
+
+		// When Connection header had "close"
+		var req2 Request
+		req2.Header.Set("Connection", "close")
+		req2.Header.Set("X-Test", "original")
+		req2.Header.ResetConnectionClose()
+		req2.Header.Set("X-New", "changed")
+		if got := string(req2.Header.Peek("X-Test")); got != "original" {
+			t.Fatalf("expected request X-Test: original, got %q", got)
+		}
+		if got := string(req2.Header.Peek("X-New")); got != "changed" {
+			t.Fatalf("expected request X-New: changed, got %q", got)
+		}
+
+		var resp2 Response
+		resp2.Header.Set("Connection", "close")
+		resp2.Header.Set("X-Test", "original")
+		resp2.Header.ResetConnectionClose()
+		resp2.Header.Set("X-New", "changed")
+		if got := string(resp2.Header.Peek("X-Test")); got != "original" {
+			t.Fatalf("expected response X-Test: original, got %q", got)
+		}
+		if got := string(resp2.Header.Peek("X-New")); got != "changed" {
+			t.Fatalf("expected response X-New: changed, got %q", got)
+		}
+	})
 }
 
 func TestRequestHeaderTooBig(t *testing.T) {
@@ -2011,15 +3789,12 @@ type bufioPeekReader struct {
 }
 
 func (r *bufioPeekReader) Read(b []byte) (int, error) {
-	if len(r.s) == 0 {
+	if r.s == "" {
 		return 0, io.EOF
 	}
 
 	r.n++
-	n := r.n
-	if len(r.s) < n {
-		n = len(r.s)
-	}
+	n := min(len(r.s), r.n)
 	src := []byte(r.s[:n])
 	r.s = r.s[n:]
 	n = copy(b, src)
@@ -2035,30 +3810,28 @@ func TestRequestHeaderBufioPeek(t *testing.T) {
 	br := bufio.NewReaderSize(r, 4096)
 	h := &RequestHeader{}
 	if err := h.Read(br); err != nil {
-		t.Fatalf("Unexpected error when reading request: %s", err)
+		t.Fatalf("Unexpected error when reading request: %v", err)
 	}
 	verifyRequestHeader(t, h, -2, "/", "foobar.com", "", "")
-	verifyTrailer(t, br, "aaaa")
 }
 
 func TestResponseHeaderBufioPeek(t *testing.T) {
 	t.Parallel()
 
 	r := &bufioPeekReader{
-		s: "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: aaa\r\n" + getHeaders(10) + "\r\n0123456789",
+		s: "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\n" + getHeaders(10) + "\r\n0123456789",
 	}
 	br := bufio.NewReaderSize(r, 4096)
 	h := &ResponseHeader{}
 	if err := h.Read(br); err != nil {
-		t.Fatalf("Unexpected error when reading response: %s", err)
+		t.Fatalf("Unexpected error when reading response: %v", err)
 	}
-	verifyResponseHeader(t, h, 200, 10, "aaa")
-	verifyTrailer(t, br, "0123456789")
+	verifyResponseHeader(t, h, 200, 10, "text/plain", "gzip")
 }
 
 func getHeaders(n int) string {
-	var h []string
-	for i := 0; i < n; i++ {
+	h := make([]string, 0, n)
+	for i := range n {
 		h = append(h, fmt.Sprintf("Header_%d: Value_%d\r\n", i, i))
 	}
 	return strings.Join(h, "")
@@ -2071,143 +3844,127 @@ func TestResponseHeaderReadSuccess(t *testing.T) {
 
 	// straight order of content-length and content-type
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n",
-		200, 123, "text/html", "")
+		200, 123, "text/html")
 	if h.ConnectionClose() {
 		t.Fatalf("unexpected connection: close")
 	}
 
 	// reverse order of content-length and content-type
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 202 OK\r\nContent-Type: text/plain; encoding=utf-8\r\nContent-Length: 543\r\nConnection: close\r\n\r\n",
-		202, 543, "text/plain; encoding=utf-8", "")
+		202, 543, "text/plain; encoding=utf-8")
 	if !h.ConnectionClose() {
 		t.Fatalf("expecting connection: close")
 	}
 
-	// tranfer-encoding: chunked
+	// transfer-encoding: chunked
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 505 Internal error\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n",
-		505, -1, "text/html", "")
+		505, -1, "text/html")
 	if h.ConnectionClose() {
 		t.Fatalf("unexpected connection: close")
 	}
 
-	// reverse order of content-type and tranfer-encoding
+	// reverse order of content-type and transfer-encoding
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 343 foobar\r\nTransfer-Encoding: chunked\r\nContent-Type: text/json\r\n\r\n",
-		343, -1, "text/json", "")
+		343, -1, "text/json")
 
 	// additional headers
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 100 Continue\r\nFoobar: baz\r\nContent-Type: aaa/bbb\r\nUser-Agent: x\r\nContent-Length: 123\r\nZZZ: werer\r\n\r\n",
-		100, 123, "aaa/bbb", "")
-
-	// trailer (aka body)
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 32245\r\n\r\nqwert aaa",
-		200, 32245, "text/plain", "qwert aaa")
+		100, 123, "aaa/bbb")
 
 	// ancient http protocol
 	testResponseHeaderReadSuccess(t, h, "HTTP/0.9 300 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\nqqqq",
-		300, 123, "text/html", "qqqq")
+		300, 123, "text/html")
 
 	// lf instead of crlf
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length: 123\nContent-Type: text/html\n\n",
-		200, 123, "text/html", "")
-
-	// Zero-length headers with mixed crlf and lf
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\nContent-Length: 345\nZero-Value: \r\nContent-Type: aaa\n: zero-key\r\n\r\nooa",
-		400, 345, "aaa", "ooa")
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n",
+		200, 123, "text/html")
 
 	// No space after colon
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length:34\nContent-Type: sss\n\naaaa",
-		200, 34, "sss", "aaaa")
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length:34\nContent-Type: sss\r\n\r\naaaa",
+		200, 34, "sss")
+
+	// space in multiline value with \r\n\r\n as body separator
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 34\r\nContent-Type: sss\r\n vvv\r\n\r\naaaa",
+		200, 34, "sss vvv")
 
 	// invalid case
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\nconTEnt-leNGTH: 123\nConTENT-TYPE: ass\n\n",
-		400, 123, "ass", "")
-
-	// duplicate content-length
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 456\r\nContent-Type: foo/bar\r\nContent-Length: 321\r\n\r\n",
-		200, 321, "foo/bar", "")
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\nconTEnt-leNGTH: 123\nConTENT-TYPE: ass\r\n\r\n",
+		400, 123, "ass")
 
 	// duplicate content-type
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 234\r\nContent-Type: foo/bar\r\nContent-Type: baz/bar\r\n\r\n",
-		200, 234, "baz/bar", "")
-
-	// both transfer-encoding: chunked and content-length
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 123\r\nTransfer-Encoding: chunked\r\n\r\n",
-		200, -1, "foo/bar", "")
+		200, 234, "baz/bar")
 
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 300 OK\r\nContent-Type: foo/barr\r\nTransfer-Encoding: chunked\r\nContent-Length: 354\r\n\r\n",
-		300, -1, "foo/barr", "")
+		300, -1, "foo/barr")
 
-	// duplicate transfer-encoding: chunked
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
-		200, -1, "text/html", "")
+	// HTTP/1.0 ignores Transfer-Encoding.
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.0 200 OK\r\nTransfer-Encoding: deflate\r\nContent-Length: 5\r\n\r\n",
+		200, 5, string(defaultContentType))
 
 	// no reason string in the first line
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 456\r\nContent-Type: xxx/yyy\r\nContent-Length: 134\r\n\r\naaaxxx",
-		456, 134, "xxx/yyy", "aaaxxx")
+		456, 134, "xxx/yyy")
 
 	// blank lines before the first line
 	testResponseHeaderReadSuccess(t, h, "\r\nHTTP/1.1 200 OK\r\nContent-Type: aa\r\nContent-Length: 0\r\n\r\nsss",
-		200, 0, "aa", "sss")
+		200, 0, "aa")
 	if h.ConnectionClose() {
 		t.Fatalf("unexpected connection: close")
 	}
 
 	// no content-length (informational responses)
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 101 OK\r\n\r\n",
-		101, -2, "text/plain; charset=utf-8", "")
+		101, -2, "text/plain; charset=utf-8")
 	if h.ConnectionClose() {
 		t.Fatalf("expecting connection: keep-alive for informational response")
 	}
 
 	// no content-length (no-content responses)
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 204 OK\r\n\r\n",
-		204, -2, "text/plain; charset=utf-8", "")
+		204, -2, "text/plain; charset=utf-8")
 	if h.ConnectionClose() {
 		t.Fatalf("expecting connection: keep-alive for no-content response")
 	}
 
 	// no content-length (not-modified responses)
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 304 OK\r\n\r\n",
-		304, -2, "text/plain; charset=utf-8", "")
+		304, -2, "text/plain; charset=utf-8")
 	if h.ConnectionClose() {
 		t.Fatalf("expecting connection: keep-alive for not-modified response")
 	}
 
 	// no content-length (identity transfer-encoding)
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\n\r\nabcdefg",
-		200, -2, "foo/bar", "abcdefg")
+		200, -2, "foo/bar")
 	if !h.ConnectionClose() {
 		t.Fatalf("expecting connection: close for identity response")
 	}
-
-	// non-numeric content-length
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: faaa\r\nContent-Type: text/html\r\n\r\nfoobar",
-		200, -2, "text/html", "foobar")
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 201 OK\r\nContent-Length: 123aa\r\nContent-Type: text/ht\r\n\r\naaa",
-		201, -2, "text/ht", "aaa")
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: aa124\r\nContent-Type: html\r\n\r\nxx",
-		200, -2, "html", "xx")
+	// See https://github.com/valyala/fasthttp/issues/1909
+	if hasArg(h.h, HeaderTransferEncoding) {
+		t.Fatalf("unexpected header: 'Transfer-Encoding' should not be present in parsed headers")
+	}
 
 	// no content-type
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\r\nContent-Length: 123\r\n\r\nfoiaaa",
-		400, 123, string(defaultContentType), "foiaaa")
+		400, 123, string(defaultContentType))
 
 	// no content-type and no default
 	h.SetNoDefaultContentType(true)
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\r\nContent-Length: 123\r\n\r\nfoiaaa",
-		400, 123, "", "foiaaa")
+		400, 123, "")
 	h.SetNoDefaultContentType(false)
 
 	// no headers
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\n\r\naaaabbb",
-		200, -2, string(defaultContentType), "aaaabbb")
+		200, -2, string(defaultContentType))
 	if !h.IsHTTP11() {
 		t.Fatalf("expecting http/1.1 protocol")
 	}
 
 	// ancient http protocol
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.0 203 OK\r\nContent-Length: 123\r\nContent-Type: foobar\r\n\r\naaa",
-		203, 123, "foobar", "aaa")
+		203, 123, "foobar")
 	if h.IsHTTP11() {
 		t.Fatalf("ancient protocol must be non-http/1.1")
 	}
@@ -2217,7 +3974,7 @@ func TestResponseHeaderReadSuccess(t *testing.T) {
 
 	// ancient http protocol with 'Connection: keep-alive' header.
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.0 403 aa\r\nContent-Length: 0\r\nContent-Type: 2\r\nConnection: Keep-Alive\r\n\r\nww",
-		403, 0, "2", "ww")
+		403, 0, "2")
 	if h.IsHTTP11() {
 		t.Fatalf("ancient protocol must be non-http/1.1")
 	}
@@ -2233,21 +3990,35 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 
 	// simple headers
 	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\nHost: google.com\r\n\r\n",
-		-2, "/foo/bar", "google.com", "", "", "")
+		-2, "/foo/bar", "google.com", "", "")
 	if h.ConnectionClose() {
 		t.Fatalf("unexpected connection: close header")
 	}
 
+	// Asterisk-form request-target is allowed for OPTIONS (RFC 9112, section 3.2.4)
+	testRequestHeaderReadSuccess(t, h, "OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n",
+		-2, "*", "example.com", "", "")
+
 	// simple headers with body
 	testRequestHeaderReadSuccess(t, h, "GET /a/bar HTTP/1.1\r\nHost: gole.com\r\nconneCTION: close\r\n\r\nfoobar",
-		-2, "/a/bar", "gole.com", "", "", "foobar")
+		-2, "/a/bar", "gole.com", "", "")
 	if !h.ConnectionClose() {
 		t.Fatalf("connection: close unset")
 	}
 
 	// ancient http protocol
 	testRequestHeaderReadSuccess(t, h, "GET /bar HTTP/1.0\r\nHost: gole\r\n\r\npppp",
-		-2, "/bar", "gole", "", "", "pppp")
+		-2, "/bar", "gole", "", "")
+	if h.IsHTTP11() {
+		t.Fatalf("ancient http protocol cannot be http/1.1")
+	}
+	if !h.ConnectionClose() {
+		t.Fatalf("expecting connectionClose for ancient http protocol")
+	}
+
+	// ancient http protocol without Host
+	testRequestHeaderReadSuccess(t, h, "GET /bar HTTP/1.0\r\n\r\npppp",
+		-2, "/bar", "", "", "")
 	if h.IsHTTP11() {
 		t.Fatalf("ancient http protocol cannot be http/1.1")
 	}
@@ -2257,7 +4028,7 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 
 	// ancient http protocol with 'Connection: keep-alive' header
 	testRequestHeaderReadSuccess(t, h, "GET /aa HTTP/1.0\r\nHost: bb\r\nConnection: keep-alive\r\n\r\nxxx",
-		-2, "/aa", "bb", "", "", "xxx")
+		-2, "/aa", "bb", "", "")
 	if h.IsHTTP11() {
 		t.Fatalf("ancient http protocol cannot be http/1.1")
 	}
@@ -2265,9 +4036,13 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 		t.Fatalf("unexpected 'connection: close' for ancient http protocol")
 	}
 
+	// HTTP/1.1 still frames a chunked body.
+	testRequestHeaderReadSuccess(t, h, "POST /te HTTP/1.1\r\nHost: aa\r\nTransfer-Encoding: chunked\r\n\r\n",
+		-1, "/te", "aa", "", "")
+
 	// complex headers with body
 	testRequestHeaderReadSuccess(t, h, "GET /aabar HTTP/1.1\r\nAAA: bbb\r\nHost: ole.com\r\nAA: bb\r\n\r\nzzz",
-		-2, "/aabar", "ole.com", "", "", "zzz")
+		-2, "/aabar", "ole.com", "", "")
 	if !h.IsHTTP11() {
 		t.Fatalf("expecting http/1.1 protocol")
 	}
@@ -2275,108 +4050,83 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 		t.Fatalf("unexpected connection: close")
 	}
 
-	// lf instead of crlf
-	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\nHost: google.com\n\n",
-		-2, "/foo/bar", "google.com", "", "", "")
-
 	// post method
 	testRequestHeaderReadSuccess(t, h, "POST /aaa?bbb HTTP/1.1\r\nHost: foobar.com\r\nContent-Length: 1235\r\nContent-Type: aaa\r\n\r\nabcdef",
-		1235, "/aaa?bbb", "foobar.com", "", "aaa", "abcdef")
-
-	// zero-length headers with mixed crlf and lf
-	testRequestHeaderReadSuccess(t, h, "GET /a HTTP/1.1\nHost: aaa\r\nZero: \n: Zero-Value\n\r\nxccv",
-		-2, "/a", "aaa", "", "", "xccv")
+		1235, "/aaa?bbb", "foobar.com", "", "aaa")
 
 	// no space after colon
-	testRequestHeaderReadSuccess(t, h, "GET /a HTTP/1.1\nHost:aaaxd\n\nsdfds",
-		-2, "/a", "aaaxd", "", "", "sdfds")
+	testRequestHeaderReadSuccess(t, h, "GET /a HTTP/1.1\r\nHost:aaaxd\r\n\r\nsdfds",
+		-2, "/a", "aaaxd", "", "")
 
 	// get with zero content-length
-	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\nHost: aaa.com\nContent-Length: 0\n\n",
-		0, "/xxx", "aaa.com", "", "", "")
+	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\r\nHost: aaa.com\nContent-Length: 0\r\n\r\n",
+		0, "/xxx", "aaa.com", "", "")
 
 	// get with non-zero content-length
-	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\nHost: aaa.com\nContent-Length: 123\n\n",
-		123, "/xxx", "aaa.com", "", "", "")
+	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 123\r\n\r\n",
+		123, "/xxx", "aaa.com", "", "")
 
 	// invalid case
-	testRequestHeaderReadSuccess(t, h, "GET /aaa HTTP/1.1\nhoST: bbb.com\n\naas",
-		-2, "/aaa", "bbb.com", "", "", "aas")
+	testRequestHeaderReadSuccess(t, h, "GET /aaa HTTP/1.1\r\nhoST: bbb.com\r\n\r\naas",
+		-2, "/aaa", "bbb.com", "", "")
 
 	// referer
-	testRequestHeaderReadSuccess(t, h, "GET /asdf HTTP/1.1\nHost: aaa.com\nReferer: bb.com\n\naaa",
-		-2, "/asdf", "aaa.com", "bb.com", "", "aaa")
-
-	// duplicate host
-	testRequestHeaderReadSuccess(t, h, "GET /aa HTTP/1.1\r\nHost: aaaaaa.com\r\nHost: bb.com\r\n\r\n",
-		-2, "/aa", "bb.com", "", "", "")
+	testRequestHeaderReadSuccess(t, h, "GET /asdf HTTP/1.1\r\nHost: aaa.com\r\nReferer: bb.com\r\n\r\naaa",
+		-2, "/asdf", "aaa.com", "bb.com", "")
 
 	// post with duplicate content-type
 	testRequestHeaderReadSuccess(t, h, "POST /a HTTP/1.1\r\nHost: aa\r\nContent-Type: ab\r\nContent-Length: 123\r\nContent-Type: xx\r\n\r\n",
-		123, "/a", "aa", "", "xx", "")
-
-	// post with duplicate content-length
-	testRequestHeaderReadSuccess(t, h, "POST /xx HTTP/1.1\r\nHost: aa\r\nContent-Type: s\r\nContent-Length: 13\r\nContent-Length: 1\r\n\r\n",
-		1, "/xx", "aa", "", "s", "")
+		123, "/a", "aa", "", "xx")
 
 	// non-post with content-type
 	testRequestHeaderReadSuccess(t, h, "GET /aaa HTTP/1.1\r\nHost: bbb.com\r\nContent-Type: aaab\r\n\r\n",
-		-2, "/aaa", "bbb.com", "", "aaab", "")
+		-2, "/aaa", "bbb.com", "", "aaab")
 
 	// non-post with content-length
 	testRequestHeaderReadSuccess(t, h, "HEAD / HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 123\r\n\r\n",
-		123, "/", "aaa.com", "", "", "")
+		123, "/", "aaa.com", "", "")
 
 	// non-post with content-type and content-length
 	testRequestHeaderReadSuccess(t, h, "GET /aa HTTP/1.1\r\nHost: aa.com\r\nContent-Type: abd/test\r\nContent-Length: 123\r\n\r\n",
-		123, "/aa", "aa.com", "", "abd/test", "")
+		123, "/aa", "aa.com", "", "abd/test")
 
 	// request uri with hostname
 	testRequestHeaderReadSuccess(t, h, "GET http://gooGle.com/foO/%20bar?xxx#aaa HTTP/1.1\r\nHost: aa.cOM\r\n\r\ntrail",
-		-2, "http://gooGle.com/foO/%20bar?xxx#aaa", "aa.cOM", "", "", "trail")
-
-	// no protocol in the first line
-	testRequestHeaderReadSuccess(t, h, "GET /foo/bar\r\nHost: google.com\r\n\r\nisdD",
-		-2, "/foo/bar", "google.com", "", "", "isdD")
+		-2, "http://gooGle.com/foO/%20bar?xxx#aaa", "aa.cOM", "", "")
 
 	// blank lines before the first line
 	testRequestHeaderReadSuccess(t, h, "\r\n\n\r\nGET /aaa HTTP/1.1\r\nHost: aaa.com\r\n\r\nsss",
-		-2, "/aaa", "aaa.com", "", "", "sss")
+		-2, "/aaa", "aaa.com", "", "")
 
-	// request uri with spaces
-	testRequestHeaderReadSuccess(t, h, "GET /foo/ bar baz HTTP/1.1\r\nHost: aa.com\r\n\r\nxxx",
-		-2, "/foo/ bar baz", "aa.com", "", "", "xxx")
+	// request uri with spaces - should be rejected per RFC 9112
+	testRequestHeaderReadError(t, h, "GET /foo/ bar baz HTTP/1.1\r\nHost: aa.com\r\n\r\nxxx")
 
 	// no host
-	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\nFOObar: assdfd\r\n\r\naaa",
-		-2, "/foo/bar", "", "", "", "aaa")
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\nFOObar: assdfd\r\n\r\naaa")
 
 	// no host, no headers
-	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\n\r\nfoobar",
-		-2, "/foo/bar", "", "", "", "foobar")
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\n\r\nfoobar")
 
 	// post without content-length and content-type
 	testRequestHeaderReadSuccess(t, h, "POST /aaa HTTP/1.1\r\nHost: aaa.com\r\n\r\nzxc",
-		-2, "/aaa", "aaa.com", "", "", "zxc")
+		-2, "/aaa", "aaa.com", "", "")
 
 	// post without content-type
 	testRequestHeaderReadSuccess(t, h, "POST /abc HTTP/1.1\r\nHost: aa.com\r\nContent-Length: 123\r\n\r\npoiuy",
-		123, "/abc", "aa.com", "", "", "poiuy")
+		123, "/abc", "aa.com", "", "")
 
 	// post without content-length
 	testRequestHeaderReadSuccess(t, h, "POST /abc HTTP/1.1\r\nHost: aa.com\r\nContent-Type: adv\r\n\r\n123456",
-		-2, "/abc", "aa.com", "", "adv", "123456")
-
-	// invalid method
-	testRequestHeaderReadSuccess(t, h, "POST /foo/bar HTTP/1.1\r\nHost: google.com\r\n\r\nmnbv",
-		-2, "/foo/bar", "google.com", "", "", "mnbv")
+		-2, "/abc", "aa.com", "", "adv")
 
 	// put request
 	testRequestHeaderReadSuccess(t, h, "PUT /faa HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 123\r\nContent-Type: aaa\r\n\r\nxwwere",
-		123, "/faa", "aaa.com", "", "aaa", "xwwere")
+		123, "/faa", "aaa.com", "", "aaa")
 }
 
 func TestResponseHeaderReadError(t *testing.T) {
+	t.Parallel()
+
 	h := &ResponseHeader{}
 
 	// incorrect first line
@@ -2392,17 +4142,48 @@ func TestResponseHeaderReadError(t *testing.T) {
 	testResponseHeaderReadError(t, h, "HTTP/1.1 123foobar OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n")
 	testResponseHeaderReadError(t, h, "HTTP/1.1 foobar344 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n")
 
+	// duplicate content-length
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 456\r\nContent-Type: foo/bar\r\nContent-Length: 321\r\n\r\n")
+
+	// non-numeric content-length
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: faaa\r\nContent-Type: text/html\r\n\r\nfoobar")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 201 OK\r\nContent-Length: 123aa\r\nContent-Type: text/ht\r\n\r\naaa")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: aa124\r\nContent-Type: html\r\n\r\nxx")
+
 	// no headers
 	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\n")
 
 	// no trailing crlf
 	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n")
+
+	// forbidden trailer
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: -1\r\nTrailer: Foo, Content-Length\r\n\r\n")
+
+	// unsupported transfer-encoding
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\nContent-Length: 5\r\n\r\n")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nContent-Length: 5\r\n\r\n")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\nContent-Length: 5\r\n\r\n")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+	// invalid Content-Length with Transfer-Encoding
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: nope\r\n\r\n")
+
+	// no protocol in the first line
+	testResponseHeaderReadError(t, h, "GET /foo/bar\r\nHost: google.com\r\n\r\nisdD")
+
+	// zero-length headers
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\n: zero-key\r\n\r\n")
+
+	// Space before header name
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\n foo: bar\r\n\r\n")
 }
 
 func TestResponseHeaderReadErrorSecureLog(t *testing.T) {
-	h := &ResponseHeader{
-		secureErrorLogMessage: true,
-	}
+	t.Parallel()
+
+	h := &ResponseHeader{}
+	h.secureErrorLogMessage = true
 
 	// incorrect first line
 	testResponseHeaderReadSecuredError(t, h, "fo")
@@ -2416,12 +4197,14 @@ func TestResponseHeaderReadErrorSecureLog(t *testing.T) {
 	testResponseHeaderReadSecuredError(t, h, "HTTP/1.1 123foobar OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n")
 	testResponseHeaderReadSecuredError(t, h, "HTTP/1.1 foobar344 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n")
 
-
 	// no headers
 	testResponseHeaderReadSecuredError(t, h, "HTTP/1.1 200 OK\r\n")
 
 	// no trailing crlf
 	testResponseHeaderReadSecuredError(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n")
+
+	// unsupported transfer-encoding
+	testResponseHeaderReadSecuredError(t, h, "HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\nContent-Length: 5\r\n\r\n")
 }
 
 func TestRequestHeaderReadError(t *testing.T) {
@@ -2440,14 +4223,57 @@ func TestRequestHeaderReadError(t *testing.T) {
 
 	// post with invalid content-length
 	testRequestHeaderReadError(t, h, "POST /a HTTP/1.1\r\nHost: bb\r\nContent-Type: aa\r\nContent-Length: dff\r\n\r\nqwerty")
+
+	// forbidden trailer
+	testRequestHeaderReadError(t, h, "POST /a HTTP/1.1\r\nContent-Length: -1\r\nTrailer: Foo, Content-Length\r\n\r\n")
+
+	// post with duplicate content-length
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.1\r\nHost: aa\r\nContent-Type: s\r\nContent-Length: 13\r\nContent-Length: 1\r\n\r\n")
+
+	// post with duplicate transfer-encoding
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.1\r\nHost: aa\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+
+	// transfer-encoding on http/1.0, with and without content-length
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.0\r\nHost: aa\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.0\r\nHost: aa\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello")
+
+	// invalid Content-Length with Transfer-Encoding
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.1\r\nHost: aa\r\nContent-Length: nope\r\nTransfer-Encoding: chunked\r\n\r\n")
+	testRequestHeaderReadError(t, h, "POST /xx HTTP/1.1\r\nHost: aa\r\nTransfer-Encoding: chunked\r\nContent-Length: nope\r\n\r\n")
+
+	// Zero-length header
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\n: zero-key\r\n\r\n")
+
+	// Invalid method
+	testRequestHeaderReadError(t, h, "G(ET /foo/bar HTTP/1.1\r\n: zero-key\r\n\r\n")
+
+	// Space before header name
+	testRequestHeaderReadError(t, h, "G(ET /foo/bar HTTP/1.1\r\n foo: bar\r\n\r\n")
+
+	// Whitespace before the colon in request header fields
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\nHost: aaa.com\r\nFoo : bar\r\n\r\n")
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\nHost : aaa.com\r\n\r\n")
+	testRequestHeaderReadError(t, h, "POST /foo/bar HTTP/1.1\r\nHost: aaa.com\r\nContent-Length : 4\r\n\r\ntest")
+	testRequestHeaderReadError(t, h, "POST /foo/bar HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding : chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n")
+
+	// Duplicate host header
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\nHost: aaa.com\r\nhost: bbb.com\r\n\r\n")
+
+	// Missing host header
+	testRequestHeaderReadError(t, h, "GET /foo/bar HTTP/1.1\r\n\r\n")
+
+	// Asterisk-form request-target is forbidden for methods other than OPTIONS (RFC 9112, section 3.2.4)
+	testRequestHeaderReadError(t, h, "GET * HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	testRequestHeaderReadError(t, h, "POST * HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	testRequestHeaderReadError(t, h, "HEAD * HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	testRequestHeaderReadError(t, h, "DELETE * HTTP/1.1\r\nHost: example.com\r\n\r\n")
 }
 
 func TestRequestHeaderReadSecuredError(t *testing.T) {
 	t.Parallel()
 
-	h := &RequestHeader{
-		secureErrorLogMessage: true,
-	}
+	h := &RequestHeader{}
+	h.secureErrorLogMessage = true
 
 	// incorrect first line
 	testRequestHeaderReadSecuredError(t, h, "fo")
@@ -2470,7 +4296,7 @@ func testResponseHeaderReadError(t *testing.T, h *ResponseHeader, headers string
 	}
 	// make sure response header works after error
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 12345\r\n\r\nsss",
-		200, 12345, "foo/bar", "sss")
+		200, 12345, "foo/bar")
 }
 
 func testResponseHeaderReadSecuredError(t *testing.T, h *ResponseHeader, headers string) {
@@ -2485,10 +4311,12 @@ func testResponseHeaderReadSecuredError(t *testing.T, h *ResponseHeader, headers
 	}
 	// make sure response header works after error
 	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 12345\r\n\r\nsss",
-		200, 12345, "foo/bar", "sss")
+		200, 12345, "foo/bar")
 }
 
 func testRequestHeaderReadError(t *testing.T, h *RequestHeader, headers string) {
+	t.Helper()
+
 	r := bytes.NewBufferString(headers)
 	br := bufio.NewReader(r)
 	err := h.Read(br)
@@ -2498,7 +4326,7 @@ func testRequestHeaderReadError(t *testing.T, h *RequestHeader, headers string) 
 
 	// make sure request header works after error
 	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\nHost: aaaa\r\n\r\nxxx",
-		-2, "/foo/bar", "aaaa", "", "", "xxx")
+		-2, "/foo/bar", "aaaa", "", "")
 }
 
 func testRequestHeaderReadSecuredError(t *testing.T, h *RequestHeader, headers string) {
@@ -2513,42 +4341,51 @@ func testRequestHeaderReadSecuredError(t *testing.T, h *RequestHeader, headers s
 	}
 	// make sure request header works after error
 	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\nHost: aaaa\r\n\r\nxxx",
-		-2, "/foo/bar", "aaaa", "", "", "xxx")
+		-2, "/foo/bar", "aaaa", "", "")
 }
 
 func testResponseHeaderReadSuccess(t *testing.T, h *ResponseHeader, headers string, expectedStatusCode, expectedContentLength int,
-	expectedContentType, expectedTrailer string) {
+	expectedContentType string,
+) {
+	t.Helper()
+
 	r := bytes.NewBufferString(headers)
 	br := bufio.NewReader(r)
 	err := h.Read(br)
 	if err != nil {
-		t.Fatalf("Unexpected error when parsing response headers: %s. headers=%q", err, headers)
+		t.Fatalf("Unexpected error when parsing response headers: %v. headers=%q", err, headers)
 	}
-	verifyResponseHeader(t, h, expectedStatusCode, expectedContentLength, expectedContentType)
-	verifyTrailer(t, br, expectedTrailer)
+	verifyResponseHeader(t, h, expectedStatusCode, expectedContentLength, expectedContentType, "")
 }
 
 func testRequestHeaderReadSuccess(t *testing.T, h *RequestHeader, headers string, expectedContentLength int,
-	expectedRequestURI, expectedHost, expectedReferer, expectedContentType, expectedTrailer string) {
+	expectedRequestURI, expectedHost, expectedReferer, expectedContentType string,
+) {
+	t.Helper()
+
 	r := bytes.NewBufferString(headers)
 	br := bufio.NewReader(r)
 	err := h.Read(br)
 	if err != nil {
-		t.Fatalf("Unexpected error when parsing request headers: %s. headers=%q", err, headers)
+		t.Fatalf("Unexpected error when parsing request headers: %v. headers=%q", err, headers)
 	}
 	verifyRequestHeader(t, h, expectedContentLength, expectedRequestURI, expectedHost, expectedReferer, expectedContentType)
-	verifyTrailer(t, br, expectedTrailer)
 }
 
-func verifyResponseHeader(t *testing.T, h *ResponseHeader, expectedStatusCode, expectedContentLength int, expectedContentType string) {
+func verifyResponseHeader(t *testing.T, h *ResponseHeader, expectedStatusCode, expectedContentLength int, expectedContentType, expectedContentEncoding string) {
+	t.Helper()
+
 	if h.StatusCode() != expectedStatusCode {
 		t.Fatalf("Unexpected status code %d. Expected %d", h.StatusCode(), expectedStatusCode)
 	}
 	if h.ContentLength() != expectedContentLength {
 		t.Fatalf("Unexpected content length %d. Expected %d", h.ContentLength(), expectedContentLength)
 	}
-	if string(h.Peek(HeaderContentType)) != expectedContentType {
-		t.Fatalf("Unexpected content type %q. Expected %q", h.Peek(HeaderContentType), expectedContentType)
+	if string(h.ContentType()) != expectedContentType {
+		t.Fatalf("Unexpected content type %q. Expected %q", h.ContentType(), expectedContentType)
+	}
+	if string(h.ContentEncoding()) != expectedContentEncoding {
+		t.Fatalf("Unexpected content encoding %q. Expected %q", h.ContentEncoding(), expectedContentEncoding)
 	}
 }
 
@@ -2559,7 +4396,8 @@ func verifyResponseHeaderConnection(t *testing.T, h *ResponseHeader, expectConne
 }
 
 func verifyRequestHeader(t *testing.T, h *RequestHeader, expectedContentLength int,
-	expectedRequestURI, expectedHost, expectedReferer, expectedContentType string) {
+	expectedRequestURI, expectedHost, expectedReferer, expectedContentType string,
+) {
 	if h.ContentLength() != expectedContentLength {
 		t.Fatalf("Unexpected Content-Length %d. Expected %d", h.ContentLength(), expectedContentLength)
 	}
@@ -2577,12 +4415,1860 @@ func verifyRequestHeader(t *testing.T, h *RequestHeader, expectedContentLength i
 	}
 }
 
-func verifyTrailer(t *testing.T, r *bufio.Reader, expectedTrailer string) {
-	trailer, err := ioutil.ReadAll(r)
-	if err != nil {
-		t.Fatalf("Cannot read trailer: %s", err)
+type peeker interface {
+	Peek(key string) []byte
+}
+
+func verifyTrailer(t *testing.T, h peeker, expectedTrailers map[string]string) {
+	for k, v := range expectedTrailers {
+		got := h.Peek(k)
+		if !bytes.Equal(got, []byte(v)) {
+			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", k, v, got)
+		}
 	}
-	if !bytes.Equal(trailer, []byte(expectedTrailer)) {
-		t.Fatalf("Unexpected trailer %q. Expected %q", trailer, expectedTrailer)
+}
+
+func TestRequestHeaderPeekAll(t *testing.T) {
+	t.Parallel()
+	h := &RequestHeader{}
+	h.Add(HeaderConnection, "keep-alive")
+	h.Add("Content-Type", "aaa")
+	h.Add(HeaderHost, "aaabbb")
+	h.Add("User-Agent", "asdfas")
+	h.Add("Content-Length", "1123")
+	h.Add("Cookie", "foobar=baz")
+	h.Add(HeaderTrailer, "foo, bar")
+	h.Add("aaa", "aaa")
+	h.Add("aaa", "bbb")
+
+	expectRequestHeaderAll(t, h, HeaderConnection, [][]byte{s2b("keep-alive")})
+	expectRequestHeaderAll(t, h, "Content-Type", [][]byte{s2b("aaa")})
+	expectRequestHeaderAll(t, h, HeaderHost, [][]byte{s2b("aaabbb")})
+	expectRequestHeaderAll(t, h, "User-Agent", [][]byte{s2b("asdfas")})
+	expectRequestHeaderAll(t, h, "Content-Length", [][]byte{s2b("1123")})
+	expectRequestHeaderAll(t, h, "Cookie", [][]byte{s2b("foobar=baz")})
+	expectRequestHeaderAll(t, h, HeaderTrailer, [][]byte{s2b("Foo, Bar")})
+	expectRequestHeaderAll(t, h, "aaa", [][]byte{s2b("aaa"), s2b("bbb")})
+
+	h.Del("Content-Type")
+	h.Del(HeaderHost)
+	h.Del("aaa")
+	expectRequestHeaderAll(t, h, "Content-Type", [][]byte{})
+	expectRequestHeaderAll(t, h, HeaderHost, [][]byte{})
+	expectRequestHeaderAll(t, h, "aaa", [][]byte{})
+	h.Del("Content-Length")
+	h.Del("Cookie")
+	h.Del(HeaderTrailer)
+	expectRequestHeaderAll(t, h, "Content-Length", [][]byte{})
+	expectRequestHeaderAll(t, h, "Cookie", [][]byte{})
+	expectRequestHeaderAll(t, h, HeaderTrailer, [][]byte{})
+
+	// Single-element values must still come back.
+	h.Add("Content-Length", "0")
+	h.Add(HeaderTrailer, "foo")
+	expectRequestHeaderAll(t, h, "Content-Length", [][]byte{s2b("0")})
+	expectRequestHeaderAll(t, h, HeaderTrailer, [][]byte{s2b("Foo")})
+}
+
+func TestRequestHeaderPeekCanonical(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("ETag")
+	value := []byte("13-1831710635")
+	var h RequestHeader
+	h.SetCanonical(key, value)
+
+	if got := h.PeekCanonical(key); !bytes.Equal(got, value) {
+		t.Fatalf("unexpected value for key %q: %q; want %q", key, got, value)
+	}
+	if string(key) != "ETag" {
+		t.Fatalf("PeekCanonical modified key: %q", key)
+	}
+}
+
+func expectRequestHeaderAll(t *testing.T, h *RequestHeader, key string, expectedValue [][]byte) {
+	if len(h.PeekAll(key)) != len(expectedValue) {
+		t.Fatalf("Unexpected size for key %q: %d. Expected %d", key, len(h.PeekAll(key)), len(expectedValue))
+	}
+	if !reflect.DeepEqual(h.PeekAll(key), expectedValue) {
+		t.Fatalf("Unexpected value for key %q: %q. Expected %q", key, h.PeekAll(key), expectedValue)
+	}
+}
+
+func TestResponseHeaderPeekAll(t *testing.T) {
+	t.Parallel()
+
+	h := &ResponseHeader{}
+	h.Add(HeaderContentType, "aaa/bbb")
+	h.Add(HeaderContentEncoding, "gzip")
+	h.Add(HeaderConnection, "close")
+	h.Add(HeaderContentLength, "1234")
+	h.Add(HeaderServer, "aaaa")
+	h.Add(HeaderSetCookie, "cccc")
+	h.Add(HeaderTrailer, "foo, bar")
+	h.Add("aaa", "aaa")
+	h.Add("aaa", "bbb")
+
+	expectResponseHeaderAll(t, h, HeaderContentType, [][]byte{s2b("aaa/bbb")})
+	expectResponseHeaderAll(t, h, HeaderContentEncoding, [][]byte{s2b("gzip")})
+	expectResponseHeaderAll(t, h, HeaderConnection, [][]byte{s2b("close")})
+	expectResponseHeaderAll(t, h, HeaderContentLength, [][]byte{s2b("1234")})
+	expectResponseHeaderAll(t, h, HeaderServer, [][]byte{s2b("aaaa")})
+	expectResponseHeaderAll(t, h, HeaderSetCookie, [][]byte{s2b("cccc")})
+	expectResponseHeaderAll(t, h, HeaderTrailer, [][]byte{s2b("Foo, Bar")})
+	expectResponseHeaderAll(t, h, "aaa", [][]byte{s2b("aaa"), s2b("bbb")})
+
+	h.Del(HeaderContentType)
+	h.Del(HeaderContentEncoding)
+	expectResponseHeaderAll(t, h, HeaderContentType, [][]byte{defaultContentType})
+	expectResponseHeaderAll(t, h, HeaderContentEncoding, [][]byte{})
+	h.Del(HeaderContentLength)
+	h.Del(HeaderSetCookie)
+	expectResponseHeaderAll(t, h, HeaderContentLength, [][]byte{})
+	expectResponseHeaderAll(t, h, HeaderSetCookie, [][]byte{})
+	h.Del(HeaderTrailer)
+	expectResponseHeaderAll(t, h, HeaderTrailer, [][]byte{})
+
+	// Single-element values must still come back.
+	h.Add(HeaderContentLength, "0")
+	h.Add(HeaderTrailer, "foo")
+	expectResponseHeaderAll(t, h, HeaderContentLength, [][]byte{s2b("0")})
+	expectResponseHeaderAll(t, h, HeaderTrailer, [][]byte{s2b("Foo")})
+}
+
+func TestResponseHeaderPeekCanonical(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("ETag")
+	value := []byte("13-1831710635")
+	var h ResponseHeader
+	h.SetCanonical(key, value)
+
+	if got := h.PeekCanonical(key); !bytes.Equal(got, value) {
+		t.Fatalf("unexpected value for key %q: %q; want %q", key, got, value)
+	}
+	if string(key) != "ETag" {
+		t.Fatalf("PeekCanonical modified key: %q", key)
+	}
+}
+
+func expectResponseHeaderAll(t *testing.T, h *ResponseHeader, key string, expectedValue [][]byte) {
+	if len(h.PeekAll(key)) != len(expectedValue) {
+		t.Fatalf("Unexpected size for key %q: %d. Expected %d", key, len(h.PeekAll(key)), len(expectedValue))
+	}
+	if !reflect.DeepEqual(h.PeekAll(key), expectedValue) {
+		t.Fatalf("Unexpected value for key %q: %q. Expected %q", key, h.PeekAll(key), expectedValue)
+	}
+}
+
+func TestRequestHeaderKeys(t *testing.T) {
+	h := &RequestHeader{}
+	h.Add(HeaderConnection, "keep-alive")
+	h.Add("Content-Type", "aaa")
+	err := h.SetTrailer("aaa,bbb,ccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualKeys := h.PeekKeys()
+	expectedKeys := [][]byte{[]byte("Content-Type"), []byte("Trailer"), []byte("Connection")}
+	if !reflect.DeepEqual(actualKeys, expectedKeys) {
+		t.Fatalf("Unexpected value %q. Expected %q", actualKeys, expectedKeys)
+	}
+	actualTrailerKeys := h.PeekTrailerKeys()
+	expectedTrailerKeys := [][]byte{s2b("Aaa"), s2b("Bbb"), s2b("Ccc")}
+	if !reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
+		t.Fatalf("Unexpected value %q. Expected %q", actualTrailerKeys, expectedTrailerKeys)
+	}
+}
+
+func TestResponseHeaderCopyToCopiesTrailerKeys(t *testing.T) {
+	t.Parallel()
+
+	var src ResponseHeader
+	var dst ResponseHeader
+
+	if err := src.SetTrailer("X-Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	src.CopyTo(&dst)
+	if err := src.SetTrailer("Y-Bar"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := dst.PeekTrailerKeys()
+	want := [][]byte{[]byte("X-Foo")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected copied trailer keys %q. Expecting %q", got, want)
+	}
+}
+
+func TestResponseHeaderKeys(t *testing.T) {
+	h := &ResponseHeader{}
+	h.Add(HeaderConnection, "keep-alive")
+	h.Add("Content-Type", "aaa")
+	err := h.SetTrailer("aaa,bbb,ccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualKeys := h.PeekKeys()
+	expectedKeys := [][]byte{[]byte("Content-Type"), []byte("Trailer"), []byte("Connection")}
+	if !reflect.DeepEqual(actualKeys, expectedKeys) {
+		t.Fatalf("Unexpected value %q. Expected %q", actualKeys, expectedKeys)
+	}
+	actualTrailerKeys := h.PeekTrailerKeys()
+	expectedTrailerKeys := [][]byte{s2b("Aaa"), s2b("Bbb"), s2b("Ccc")}
+	if !reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
+		t.Fatalf("Unexpected value %q. Expected %q", actualTrailerKeys, expectedTrailerKeys)
+	}
+}
+
+func TestAddVaryHeader(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+
+	h.addVaryBytes([]byte("Accept-Encoding"))
+	got := string(h.Peek("Vary"))
+	expected := "Accept-Encoding"
+	if got != expected {
+		t.Errorf("expected %q got %q", expected, got)
+	}
+
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		t.Fatalf("unexpected error when writing header: %v", err)
+	}
+
+	if n := strings.Count(buf.String(), "Vary: "); n != 1 {
+		t.Errorf("Vary occurred %d times", n)
+	}
+}
+
+func TestAddVaryHeaderExisting(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+
+	h.Set("Vary", "Accept")
+	h.addVaryBytes([]byte("Accept-Encoding"))
+	got := string(h.Peek("Vary"))
+	expected := "Accept,Accept-Encoding"
+	if got != expected {
+		t.Errorf("expected %q got %q", expected, got)
+	}
+
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		t.Fatalf("unexpected error when writing header: %v", err)
+	}
+
+	if n := strings.Count(buf.String(), "Vary: "); n != 1 {
+		t.Errorf("Vary occurred %d times", n)
+	}
+}
+
+func TestAddVaryHeaderExistingAcceptEncoding(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+
+	h.Set("Vary", "Accept-Encoding")
+	h.addVaryBytes([]byte("Accept-Encoding"))
+	got := string(h.Peek("Vary"))
+	expected := "Accept-Encoding"
+	if got != expected {
+		t.Errorf("expected %q got %q", expected, got)
+	}
+
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		t.Fatalf("unexpected error when writing header: %v", err)
+	}
+
+	if n := strings.Count(buf.String(), "Vary: "); n != 1 {
+		t.Errorf("Vary occurred %d times", n)
+	}
+}
+
+func TestRequestHeaderExtraWhitespace(t *testing.T) {
+	var h RequestHeader
+
+	// Match net/http: extra spaces in the request line are still rejected,
+	// but they are parsed using the raw split semantics of the first line.
+	testCases := []string{
+		"GET  /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",    // Extra space after method
+		"GET   /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Multiple spaces after method
+		"GET /foo  HTTP/1.1\r\nHost: example.com\r\n\r\n",    // Extra space before HTTP version
+		"GET /foo   HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Multiple spaces before HTTP version
+		"GET  /foo  HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Extra spaces in both places
+		"GET   /foo   HTTP/1.1\r\nHost: example.com\r\n\r\n", // Multiple extra spaces in both places
+	}
+
+	for i, testCase := range testCases {
+		br := bufio.NewReader(bytes.NewBufferString(testCase))
+		err := h.Read(br)
+		if err == nil {
+			t.Errorf("Test case %d should have failed but didn't. Request: %q", i, testCase)
+		}
+	}
+}
+
+func TestRequestHeaderValidWhitespace(t *testing.T) {
+	var h RequestHeader
+
+	// Test cases that should succeed (proper single space separation)
+	testCases := []struct {
+		request        string
+		expectedMethod string
+		expectedURI    string
+	}{
+		{
+			"GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",
+			"GET",
+			"/foo",
+		},
+		{
+			"POST /api/v1/users HTTP/1.1\r\nHost: example.com\r\n\r\n",
+			"POST",
+			"/api/v1/users",
+		},
+		{
+			"PUT /resource HTTP/1.0\r\nHost: example.com\r\n\r\n",
+			"PUT",
+			"/resource",
+		},
+	}
+
+	for i, testCase := range testCases {
+		br := bufio.NewReader(bytes.NewBufferString(testCase.request))
+		err := h.Read(br)
+		if err != nil {
+			t.Errorf("Test case %d should have succeeded but failed with: %v. Request: %q", i, err, testCase.request)
+			continue
+		}
+
+		if string(h.Method()) != testCase.expectedMethod {
+			t.Errorf("Test case %d: expected method %q but got %q", i, testCase.expectedMethod, h.Method())
+		}
+
+		if string(h.RequestURI()) != testCase.expectedURI {
+			t.Errorf("Test case %d: expected URI %q but got %q", i, testCase.expectedURI, h.RequestURI())
+		}
+	}
+}
+
+func TestRequestHeaderEmptyPathWithQuery(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetMethod(MethodGet)
+	h.SetHost("example.com")
+	h.SetRequestURI("?foo=bar")
+
+	got := string(h.RequestURI())
+	if got != "/?foo=bar" {
+		t.Fatalf("unexpected RequestURI %q. Expecting %q", got, "/?foo=bar")
+	}
+
+	firstLine, _, _ := strings.Cut(string(h.Header()), "\r\n")
+	if firstLine != "GET /?foo=bar HTTP/1.1" {
+		t.Fatalf("unexpected request line %q. Expecting %q", firstLine, "GET /?foo=bar HTTP/1.1")
+	}
+}
+
+func TestURIHostMemoIsBounded(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	big := bytes.Repeat([]byte("a"), 4096)
+	if err := u.Parse(big, []byte("/")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cap(u.hostRaw) > maxMemoizedHostLen || cap(u.hostParsed) > maxMemoizedHostLen {
+		t.Errorf("memo retained %d/%d bytes for a %d byte authority",
+			cap(u.hostRaw), cap(u.hostParsed), len(big))
+	}
+	// A normal authority is still memoized and still parses correctly.
+	if err := u.Parse([]byte("Example.COM:8080"), []byte("/")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(u.Host()) != "example.com:8080" {
+		t.Fatalf("host %q", u.Host())
+	}
+	if err := u.Parse([]byte("Example.COM:8080"), []byte("/")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(u.Host()) != "example.com:8080" {
+		t.Fatalf("memoized host %q", u.Host())
+	}
+}
+
+func TestScanHeaderKey(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		line       string
+		colon      int
+		innerSpace bool
+		valid      bool
+	}{
+		{"Content-Type: text/html", 12, false, true},
+		{"Content-Type : text/html", 13, false, true},
+		{"Content-Type  :", 14, false, true},
+		{"Content Type: a", 12, true, true},
+		{"Content Type : a", 13, true, true},
+		{"Content-Type", -1, false, false},
+		{"", -1, false, false},
+		{": a", 0, false, false},
+		{"Content\tType: a", 12, false, false},
+		{"Content\tType", -1, false, false},
+		{"\xffoo: bar", 3, false, false},
+		{"a:b:c", 1, false, true},
+	} {
+		colon, innerSpace, valid := scanHeaderKey([]byte(tc.line))
+		if colon != tc.colon || innerSpace != tc.innerSpace || valid != tc.valid {
+			t.Fatalf("unexpected result for %q: colon=%d innerSpace=%v valid=%v. Expecting colon=%d innerSpace=%v valid=%v",
+				tc.line, colon, innerSpace, valid, tc.colon, tc.innerSpace, tc.valid)
+		}
+	}
+}
+
+func TestRequestHeaderReadManyLines(t *testing.T) {
+	t.Parallel()
+
+	n := 562
+	var sb strings.Builder
+	sb.WriteString("GET / HTTP/1.1\r\nHost: foobar.com\r\n")
+	for i := range n {
+		fmt.Fprintf(&sb, "X-Header-%d: value-%d\r\n", i, i)
+	}
+	sb.WriteString("\r\n")
+	s := sb.String()
+
+	var h RequestHeader
+	br := bufio.NewReaderSize(bytes.NewBufferString(s), len(s))
+	if err := h.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(h.Host()) != "foobar.com" {
+		t.Fatalf("unexpected host: %q", h.Host())
+	}
+	for i := range n {
+		key := fmt.Sprintf("X-Header-%d", i)
+		if v := h.Peek(key); string(v) != fmt.Sprintf("value-%d", i) {
+			t.Fatalf("unexpected value for %q: %q", key, v)
+		}
+	}
+	if raw := h.RawHeaders(); string(raw) != s[len("GET / HTTP/1.1\r\n"):] {
+		t.Fatalf("unexpected raw headers length %d, expecting %d", len(raw), len(s)-len("GET / HTTP/1.1\r\n"))
+	}
+	if br.Buffered() != 0 {
+		t.Fatalf("unexpected buffered bytes: %d", br.Buffered())
+	}
+}
+
+func TestRequestHeaderMethodDefaultIsRequestLocal(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	m := h.Method()
+	if string(m) != MethodGet {
+		t.Fatalf("unexpected default method %q. Expecting %q", m, MethodGet)
+	}
+	m[0] = 'X'
+
+	var h2 RequestHeader
+	if m2 := h2.Method(); string(m2) != MethodGet {
+		t.Fatalf("default method of another header changed to %q", m2)
+	}
+
+	h.Reset()
+	if m := h.Method(); string(m) != MethodGet {
+		t.Fatalf("unexpected default method after reset %q. Expecting %q", m, MethodGet)
+	}
+}
+
+func TestResponseHeaderSetServerOverridesDefault(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	line := []byte("Server: edge\r\n")
+	h.serverDefaultLine = line
+	if string(h.Server()) != "edge" {
+		t.Fatalf("Server()=%q", h.Server())
+	}
+	// The line is shared by every connection; a handler writing into what
+	// Server() returned must not reach it.
+	h.Server()[0] = 'X'
+	if string(line) != "Server: edge\r\n" {
+		t.Fatalf("shared line changed to %q", line)
+	}
+	if !bytes.Contains(h.Header(), []byte("Server: Xdge\r\n")) {
+		t.Fatalf("header %q lost the handler's edit", h.Header())
+	}
+	// An explicit setter wins, including the empty value, as it did when the
+	// default was a plain Set.
+	h.SetServer("")
+	if len(h.Server()) != 0 {
+		t.Errorf("Server()=%q after SetServer(\"\"), expecting empty", h.Server())
+	}
+}
+
+func TestServerDateLine(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 27, 8, 0, 0, 0, time.UTC)
+	if got, want := string(serverDateLineFor(now)), "Date: Sun, 27 Sep 2026 08:00:00 GMT\r\n"; got != want {
+		t.Fatalf("date line %q, expecting %q", got, want)
+	}
+
+	var h, parsed ResponseHeader
+	if err := parsed.Read(bufio.NewReader(bytes.NewReader(h.Header()))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := ParseHTTPDate(parsed.Peek(HeaderDate)); err != nil {
+		t.Fatalf("Date %q: %v", parsed.Peek(HeaderDate), err)
+	}
+}
+
+// dripTestReader returns one byte per Read, forcing incremental parsing.
+type dripTestReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *dripTestReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	p[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
+func TestResponseHeaderReadTrailerIncremental(t *testing.T) {
+	t.Parallel()
+
+	br := bufio.NewReaderSize(&dripTestReader{data: []byte("X-Meta: one\r\nY-Second: two\r\n\r\n")}, 4096)
+	var h ResponseHeader
+	if err := h.ReadTrailer(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(h.trailerH) != 2 {
+		t.Fatalf("stored %d trailer fields, expecting 2", len(h.trailerH))
+	}
+
+	// A field completed by one retry must not be appended again by the next.
+	wire := make([]byte, 0, 50*len("X-Pad: v\r\n")+2)
+	for range 50 {
+		wire = append(wire, "X-Pad: v\r\n"...)
+	}
+	wire = append(wire, "\r\n"...)
+	var h2 ResponseHeader
+	if err := h2.ReadTrailer(bufio.NewReaderSize(&dripTestReader{data: wire}, 4096)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(h2.trailerH) != 50 {
+		t.Fatalf("stored %d trailer fields, expecting 50", len(h2.trailerH))
+	}
+}
+
+func TestRequestHeaderFoldedRawHeadersAllocations(t *testing.T) {
+	wire := make([]byte, 0, 1024)
+	wire = append(wire, "GET / HTTP/1.1\r\nHost: x\r\n"...)
+	for i := range 40 {
+		wire = append(wire, "X-Fold-"...)
+		wire = append(wire, byte('a'+i%26))
+		wire = append(wire, ": v1\r\n \tv2\r\n"...)
+	}
+	wire = append(wire, "\r\n"...)
+
+	var h RequestHeader
+	br := bufio.NewReaderSize(bytes.NewReader(wire), 8192)
+	if err := h.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	n := testing.AllocsPerRun(50, func() {
+		br := bufio.NewReaderSize(bytes.NewReader(wire), 8192)
+		if err := h.Read(br); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// bufio.NewReaderSize allocates the reader and its buffer each run.
+	if n > 2 {
+		t.Errorf("%v allocs/op parsing folded headers, expecting the reader's own", n)
+	}
+}
+
+func TestScanValueLineMatchesValidation(t *testing.T) {
+	t.Parallel()
+
+	// Every byte value, at every offset within and across the scanned words.
+	for c := range 256 {
+		for pad := range 20 {
+			line := append(bytes.Repeat([]byte("a"), pad), byte(c))
+			line = append(line, "bb\r\n"...)
+			lf, valid := scanValueLine(line)
+			wantLF := bytes.IndexByte(line, '\n')
+			if lf != wantLF {
+				t.Fatalf("byte %#x at offset %d: line end %d, expecting %d", c, pad, lf, wantLF)
+			}
+			body := line[:wantLF]
+			if len(body) > 0 && body[len(body)-1] == '\r' {
+				body = body[:len(body)-1]
+			}
+			want := true
+			for _, c := range body {
+				if !validHeaderValueByte(c) {
+					want = false
+					break
+				}
+			}
+			if valid != want {
+				t.Fatalf("byte %#x at offset %d: valid=%v, expecting %v", c, pad, valid, want)
+			}
+		}
+	}
+
+	if lf, _ := scanValueLine([]byte("no terminator here")); lf != -1 {
+		t.Fatalf("line end %d, expecting -1", lf)
+	}
+}
+
+func TestRequestHeaderBlockNeedsCRLFCRLF(t *testing.T) {
+	t.Parallel()
+
+	// A block whose last header line ends in a bare LF is not terminated by
+	// CRLFCRLF, so it must not be accepted: a peer that frames on CRLFCRLF
+	// would read the stream differently.
+	for _, wire := range []string{
+		"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\n\r\nsmuggled",
+		"POST / HTTP/1.1\r\nHost: a\nContent-Length: 3\n\r\nabc",
+	} {
+		var req Request
+		br := bufio.NewReader(bytes.NewBufferString(wire))
+		if err := req.Read(br); err == nil {
+			t.Errorf("accepted a block terminated by \"\\n\\r\\n\": %q", wire)
+		}
+	}
+
+	// The same block does terminate once a CRLFCRLF is present.
+	for _, wire := range []string{
+		"GET / HTTP/1.1\r\nHost: a\nConnection: keep-alive\r\n\r\n",
+		"GET / HTTP/1.1\r\nHost: a\nX: y\n\r\n\r\n",
+	} {
+		var req Request
+		br := bufio.NewReader(bytes.NewBufferString(wire))
+		if err := req.Read(br); err != nil {
+			t.Errorf("rejected %q: %v", wire, err)
+		}
+	}
+}
+
+func TestRequestHeaderFoldedParseStaysLinear(t *testing.T) {
+	// Joining continuation lines must not rescan for the block terminator
+	// per fold: that turns an ordinary accepted request into a CPU
+	// amplifier. Compare the cost of two sizes rather than absolute time.
+	wire := func(target int) []byte {
+		w := make([]byte, 0, target+64)
+		w = append(w, "GET / HTTP/1.1\r\nHost: x\r\n"...)
+		for len(w) < target {
+			w = append(w, "A:\r\n \r\n"...)
+		}
+		return append(w, "\r\n"...)
+	}
+	parse := func(b []byte, iterations int) time.Duration {
+		var h RequestHeader
+		start := time.Now()
+		for range iterations {
+			br := bufio.NewReaderSize(bytes.NewReader(b), 32768)
+			if err := h.Read(br); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		}
+		return time.Since(start)
+	}
+	small, large := wire(2048), wire(16384)
+	// Enough iterations for the small case to register on a coarse clock.
+	iterations := 1
+	elapsedSmall := parse(small, iterations)
+	for elapsedSmall < 10*time.Millisecond {
+		iterations *= 2
+		elapsedSmall = parse(small, iterations)
+	}
+	ratio := float64(parse(large, iterations)) / float64(elapsedSmall)
+	// Linear would be 8x for 8x the input; quadratic would be around 64x.
+	if ratio > 24 {
+		t.Errorf("8x the folded input cost %.1fx the time, expecting roughly linear", ratio)
+	}
+}
+
+func TestRequestHeaderFoldedRawCapacityIsBounded(t *testing.T) {
+	// The fold path secures the raw block into rawHeaders; the reservation
+	// must follow the block, not everything the reader happens to hold.
+	wire := make([]byte, 0, 32768)
+	wire = append(wire, "GET / HTTP/1.1\r\nHost: x\r\nX-Fold: a\r\n b\r\n\r\n"...)
+	for len(wire) < 24000 {
+		wire = append(wire, "GET /next HTTP/1.1\r\nHost: x\r\n\r\n"...)
+	}
+	var h RequestHeader
+	br := bufio.NewReaderSize(bytes.NewReader(wire), 32768)
+	if err := h.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(h.RawHeaders()); got != "Host: x\r\nX-Fold: a\r\n b\r\n\r\n" {
+		t.Fatalf("raw headers %q", got)
+	}
+	if c := cap(h.rawHeaders); c > 512 {
+		t.Errorf("rawHeaders capacity %d for a %d byte block, expecting it to follow the block",
+			c, len(h.RawHeaders()))
+	}
+}
+
+func TestRequestHeaderAllInOrderBareLFTerminator(t *testing.T) {
+	t.Parallel()
+
+	// A block ended by a bare LF is accepted when a CRLFCRLF follows in the
+	// buffer; AllInOrder iterates its fields like any other block's.
+	var req Request
+	br := bufio.NewReader(bytes.NewBufferString("GET / HTTP/1.1\r\nHost: a\r\nX: y\n\nGET /x HTTP/1.1\r\nHost: b\r\n\r\n"))
+	if err := req.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var got []string
+	for k, v := range req.Header.AllInOrder() {
+		got = append(got, string(k)+"="+string(v))
+	}
+	if s := strings.Join(got, ","); s != "Host=a,X=y" {
+		t.Fatalf("AllInOrder yielded %q, expecting Host=a,X=y", s)
+	}
+}
+
+func TestRequestHeaderTrickledParseStaysLinear(t *testing.T) {
+	// A peer delivering the block a byte at a time must not make every
+	// retry rescan the whole block for the terminator. Compare the cost of
+	// two sizes rather than absolute time.
+	wire := func(target int) []byte {
+		w := make([]byte, 0, target+64)
+		w = append(w, "GET / HTTP/1.1\r\nHost: x\r\n"...)
+		for len(w) < target {
+			w = append(w, "X-Header-Name: some ordinary header value here\r\n"...)
+		}
+		return append(w, "\r\n"...)
+	}
+	parse := func(b []byte, iterations int) time.Duration {
+		var h RequestHeader
+		dr := &dripTestReader{data: b}
+		br := bufio.NewReaderSize(dr, 65536)
+		start := time.Now()
+		for range iterations {
+			dr.pos = 0
+			br.Reset(dr)
+			if err := h.Read(br); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		}
+		return time.Since(start)
+	}
+	small, large := wire(2048), wire(16384)
+	// Enough iterations for the small case to register on a coarse clock.
+	iterations := 1
+	elapsedSmall := parse(small, iterations)
+	for elapsedSmall < 10*time.Millisecond {
+		iterations *= 2
+		elapsedSmall = parse(small, iterations)
+	}
+	ratio := float64(parse(large, iterations)) / float64(elapsedSmall)
+	// Linear would be 8x for 8x the input; quadratic would be around 64x.
+	if ratio > 24 {
+		t.Errorf("8x the trickled input cost %.1fx the time, expecting roughly linear", ratio)
+	}
+}
+
+func TestHeaderEmptyBlockAfterBareLFInFragments(t *testing.T) {
+	t.Parallel()
+
+	// A start line ending in a bare LF followed by an empty CRLF block is
+	// accepted, and how the bytes arrive must not change that; the bare-LF
+	// empty block stays rejected.
+	for _, size := range []int{1, 2, 3, 64} {
+		for _, tc := range []struct {
+			wire string
+			ok   bool
+		}{
+			{"GET / HTTP/1.0\n\r\n", true},
+			{"GET / HTTP/1.0\r\n\r\n", true},
+			{"GET / HTTP/1.0\n\n", false},
+		} {
+			br := bufio.NewReader(&fragmentReader{data: []byte(tc.wire), size: size})
+			var req Request
+			err := req.Read(br)
+			if (err == nil) != tc.ok {
+				t.Errorf("request %q in %d-byte reads: err=%v, expecting ok=%v", tc.wire, size, err, tc.ok)
+			}
+		}
+		for _, tc := range []struct {
+			wire string
+			ok   bool
+		}{
+			{"HTTP/1.1 204 No Content\n\r\n", true},
+			{"HTTP/1.1 204 No Content\r\n\r\n", true},
+			{"HTTP/1.1 204 No Content\n\n", false},
+		} {
+			br := bufio.NewReader(&fragmentReader{data: []byte(tc.wire), size: size})
+			var resp Response
+			err := resp.Read(br)
+			if (err == nil) != tc.ok {
+				t.Errorf("response %q in %d-byte reads: err=%v, expecting ok=%v", tc.wire, size, err, tc.ok)
+			}
+		}
+	}
+}
+
+// fragmentReader hands out at most size bytes per Read.
+
+// fragmentReader hands out at most size bytes per Read.
+type fragmentReader struct {
+	data []byte
+	pos  int
+	size int
+}
+
+func (r *fragmentReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p[:min(len(p), r.size)], r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func TestAddTrailerExtendsAnnouncedSet(t *testing.T) {
+	t.Parallel()
+
+	for _, header := range []interface {
+		Add(key, value string)
+		PeekTrailerKeys() [][]byte
+	}{&RequestHeader{}, &ResponseHeader{}} {
+		header.Add(HeaderTrailer, "Foo")
+		header.Add(HeaderTrailer, "Bar")
+		header.Add(HeaderTrailer, "Foo")
+		keys := header.PeekTrailerKeys()
+		if len(keys) != 2 {
+			t.Fatalf("%T trailer keys after Foo, Bar, Foo = %q, want a two-name set", header, keys)
+		}
+	}
+}
+
+func TestAddTrailerKeepsRawHeaderMode(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.DisableSpecialHeader()
+	h.DisableNormalizing()
+	h.Add("trailer", "Foo")
+	if got := string(h.Peek("trailer")); got != "Foo" {
+		t.Fatalf("Peek(trailer) = %q, want it kept as a raw header", got)
+	}
+}
+
+func TestTrailerAnnouncementDedupesBeyondIndexThreshold(t *testing.T) {
+	t.Parallel()
+
+	// More names than trailerSetMin, so the parse loop indexes the set, with
+	// duplicates inside one field and across both of them.
+	names := make([]string, 2*trailerSetMin+8)
+	for i := range names {
+		names[i] = fmt.Sprintf("X-T%d", i)
+	}
+	half := len(names) / 2
+	first := make([]string, 0, 2*half)
+	second := make([]string, 0, 2*(len(names)-half))
+	for _, name := range names[:half] {
+		first = append(first, name, name)
+	}
+	for _, name := range names[half:] {
+		second = append(second, name, names[0])
+	}
+
+	var req Request
+	err := req.Read(bufio.NewReaderSize(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"+
+			"Trailer: "+strings.Join(first, ",")+"\r\n"+
+			"Trailer: "+strings.Join(second, ",")+"\r\n\r\n0\r\n\r\n"), 1<<16))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := req.Header.PeekTrailerKeys()
+	if len(keys) != len(names) {
+		t.Fatalf("trailer keys = %d names, want %d", len(keys), len(names))
+	}
+	for i, key := range keys {
+		if string(key) != names[i] {
+			t.Fatalf("trailer key %d = %q, want %q", i, key, names[i])
+		}
+	}
+}
+
+func TestTrailerAnnouncementSharesIndexAcrossFields(t *testing.T) {
+	t.Parallel()
+
+	// One Trailer field per name, past trailerSetMin in total, so the index
+	// has to carry across fields: a per-field index would rebuild from
+	// h.trailer every time, and the names of the field before it would have
+	// to be found by the scan it replaces.
+	names := make([]string, 4*trailerSetMin+8)
+	fields := make([]string, 0, len(names)+2)
+	for i := range names {
+		names[i] = fmt.Sprintf("X-T%d", i)
+		fields = append(fields, "Trailer: "+names[i]+"\r\n")
+	}
+	// A name repeated in a later field of its own, and one repeated in a
+	// field that also carries a new name, add no second key.
+	fields = append(fields,
+		"Trailer: "+names[0]+"\r\n",
+		"Trailer: "+names[len(names)-1]+","+names[len(names)/2]+"\r\n")
+
+	var req Request
+	err := req.Read(bufio.NewReaderSize(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n"+
+			strings.Join(fields, "")+"\r\n0\r\n\r\n"), 1<<16))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := req.Header.PeekTrailerKeys()
+	if len(keys) != len(names) {
+		t.Fatalf("trailer keys = %d names, want %d", len(keys), len(names))
+	}
+	for i, key := range keys {
+		if string(key) != names[i] {
+			t.Fatalf("trailer key %d = %q, want %q", i, key, names[i])
+		}
+	}
+}
+
+func TestTrailerSectionDedupesBeyondIndexThreshold(t *testing.T) {
+	t.Parallel()
+
+	names := make([]string, 2*trailerSetMin+8)
+	section := make([]string, 0, len(names)+1)
+	for i := range names {
+		names[i] = fmt.Sprintf("X-T%d", i)
+		section = append(section, names[i]+": v")
+	}
+	// A repeat in the section keeps its value but adds no second key.
+	section = append(section, names[0]+": again")
+
+	var req Request
+	err := req.Read(bufio.NewReaderSize(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"+
+			strings.Join(section, "\r\n")+"\r\n\r\n"), 1<<16))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := req.Header.PeekTrailerKeys()
+	if len(keys) != len(names) {
+		t.Fatalf("trailer keys = %d names, want %d", len(keys), len(names))
+	}
+	for i, key := range keys {
+		if string(key) != names[i] {
+			t.Fatalf("trailer key %d = %q, want %q", i, key, names[i])
+		}
+	}
+	if got := string(req.Header.Peek(names[0])); got != "v" {
+		t.Fatalf("Peek(%s) = %q, want v", names[0], got)
+	}
+}
+
+func TestParsedTrailerFieldsAccumulate(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	err := req.Read(bufio.NewReader(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nTrailer: X-A\r\nTrailer: X-B\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.PeekTrailerKeys(); len(got) != 2 || string(got[0]) != "X-A" || string(got[1]) != "X-B" {
+		t.Fatalf("trailer keys = %q, want [X-A X-B]", got)
+	}
+}
+
+func TestReadTrailerRecordsUnannouncedKeys(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	r := bufio.NewReader(strings.NewReader("X-Late: v\r\n\r\n"))
+	if err := h.ReadTrailer(r); err != nil {
+		t.Fatalf("ReadTrailer() error: %v", err)
+	}
+	keys := h.PeekTrailerKeys()
+	if len(keys) != 1 || string(keys[0]) != "X-Late" {
+		t.Fatalf("trailer keys = %q, want [X-Late]", keys)
+	}
+	if got := string(h.Peek("X-Late")); got != "v" {
+		t.Fatalf("Peek(X-Late) = %q, want v", got)
+	}
+}
+
+func TestTrailerHeaderKeepsEveryValue(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	if err := h.SetTrailer("X-T"); err != nil {
+		t.Fatal(err)
+	}
+	h.Add("X-T", "one")
+	h.Add("X-T", "two")
+	if got := string(h.TrailerHeader()); got != "X-T: one\r\nX-T: two\r\n\r\n" {
+		t.Fatalf("TrailerHeader() = %q, want both values", got)
+	}
+}
+
+// Values keep the section they arrived in: an upfront field that shares its
+// name with a trailer stays a header, the trailer stays a trailer.
+func TestTrailerSectionProvenance(t *testing.T) {
+	t.Parallel()
+
+	raw := "POST / HTTP/1.1\r\nHost: a\r\nX-Mixed: upfront\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"4\r\nbody\r\n0\r\nX-Mixed: late\r\nX-Late: v\r\n\r\n"
+	var req Request
+	if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+		t.Fatalf("Read() error: %v", err)
+	}
+	h := &req.Header
+
+	if got := string(h.Peek("X-Mixed")); got != "upfront" {
+		t.Fatalf("Peek(X-Mixed) = %q, want the upfront value", got)
+	}
+	if got := h.PeekAll("X-Mixed"); len(got) != 2 || string(got[0]) != "upfront" || string(got[1]) != "late" {
+		t.Fatalf("PeekAll(X-Mixed) = %q, want [upfront late]", got)
+	}
+	if got := string(h.Peek("X-Late")); got != "v" {
+		t.Fatalf("Peek(X-Late) = %q, want v", got)
+	}
+	var section []string
+	for k, v := range h.All() {
+		if string(k) == "X-Mixed" || string(k) == "X-Late" {
+			section = append(section, string(k)+"="+string(v))
+		}
+	}
+	if len(section) != 1 || section[0] != "X-Mixed=upfront" {
+		t.Fatalf("All() carried %v, want only the upfront X-Mixed", section)
+	}
+	if got := string(h.TrailerHeader()); got != "X-Mixed: late\r\nX-Late: v\r\n\r\n" {
+		t.Fatalf("TrailerHeader() = %q", got)
+	}
+	head := string(h.Header())
+	if !strings.Contains(head, "X-Mixed: upfront\r\n") || strings.Contains(head, "late") {
+		t.Fatalf("Header() = %q, want the upfront value and no trailer", head)
+	}
+	if keys := h.PeekTrailerKeys(); len(keys) != 2 {
+		t.Fatalf("PeekTrailerKeys() = %q, want the two received names", keys)
+	}
+
+	h.Del("X-Mixed")
+	if h.Peek("X-Mixed") != nil || string(h.TrailerHeader()) != "X-Late: v\r\n\r\n" {
+		t.Fatalf("Del left X-Mixed in a section: %q / %q", h.Peek("X-Mixed"), h.TrailerHeader())
+	}
+}
+
+// Announcing a name after setting it moves the value to the trailer section;
+// the trailer section and the announcement survive CopyTo and go with Reset.
+func TestTrailerSectionCopyReset(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	h.noDefaultDate = true
+	h.Set("X-T", "one")
+	h.Add("X-T", "two")
+	if err := h.AddTrailer("X-T"); err != nil {
+		t.Fatal(err)
+	}
+	if head := string(h.Header()); strings.Contains(head, "X-T: ") {
+		t.Fatalf("Header() still carries the announced value: %q", head)
+	}
+	var dst ResponseHeader
+	h.CopyTo(&dst)
+	if got := string(dst.TrailerHeader()); got != "X-T: one\r\nX-T: two\r\n\r\n" {
+		t.Fatalf("copied TrailerHeader() = %q", got)
+	}
+	if got := dst.PeekAll("X-T"); len(got) != 2 {
+		t.Fatalf("copied PeekAll(X-T) = %q, want both values", got)
+	}
+	dst.Reset()
+	if dst.Peek("X-T") != nil || string(dst.TrailerHeader()) != "\r\n" || len(dst.PeekTrailerKeys()) != 0 {
+		t.Fatal("Reset left trailer state behind")
+	}
+}
+
+// A response read with trailers writes back with the same sections.
+func TestResponseTrailerRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	raw := "HTTP/1.1 200 OK\r\nX-Mixed: upfront\r\nTrailer: X-Mixed\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"4\r\nbody\r\n0\r\nX-Mixed: late\r\n\r\n"
+	var resp Response
+	if err := resp.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+		t.Fatalf("Read() error: %v", err)
+	}
+	resp.Header.noDefaultDate = true
+	// Trailers ride only on a chunked body, which is how a proxy forwards one.
+	payload := append([]byte(nil), resp.Body()...)
+	resp.SetBodyStream(bytes.NewReader(payload), -1)
+	var out bytes.Buffer
+	bw := bufio.NewWriter(&out)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	_ = bw.Flush()
+	head, body, ok := strings.Cut(out.String(), "\r\n\r\n")
+	if !ok {
+		t.Fatalf("no header terminator in %q", out.String())
+	}
+	if !strings.Contains(head, "X-Mixed: upfront\r\n") || !strings.Contains(head, "Trailer: X-Mixed") || strings.Contains(head, "late") {
+		t.Fatalf("header block = %q", head)
+	}
+	if !strings.HasSuffix(body, "0\r\nX-Mixed: late\r\n\r\n") {
+		t.Fatalf("body = %q, want it to end with the single trailer value", body)
+	}
+}
+
+// A request built by hand sends its announced values in the trailer section.
+func TestRequestWriteProgrammaticTrailers(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.SetRequestURI("http://a/")
+	req.Header.SetMethod(MethodPost)
+	if err := req.Header.SetTrailer("X-T"); err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Add("X-T", "one")
+	req.Header.Add("X-T", "two")
+	req.SetBodyStream(strings.NewReader("body"), -1)
+	var out bytes.Buffer
+	bw := bufio.NewWriter(&out)
+	if err := req.Write(bw); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	_ = bw.Flush()
+	head, body, _ := strings.Cut(out.String(), "\r\n\r\n")
+	if !strings.Contains(head, "Trailer: X-T") || strings.Contains(head, "X-T: ") {
+		t.Fatalf("header block = %q", head)
+	}
+	if !strings.HasSuffix(body, "0\r\nX-T: one\r\nX-T: two\r\n\r\n") {
+		t.Fatalf("body = %q, want both trailer values after the last chunk", body)
+	}
+}
+
+func BenchmarkRequestReadChunked(b *testing.B) {
+	benchmarkRequestReadChunked(b, "4\r\nbody\r\n0\r\n\r\n")
+}
+
+func BenchmarkRequestReadChunkedTrailers(b *testing.B) {
+	benchmarkRequestReadChunked(b, "4\r\nbody\r\n0\r\nX-A: one\r\nX-B: two\r\n\r\n")
+}
+
+func benchmarkRequestReadChunked(b *testing.B, body string) {
+	raw := []byte("POST / HTTP/1.1\r\nHost: a\r\nX-Up: front\r\nTrailer: X-A\r\nTransfer-Encoding: chunked\r\n\r\n" + body)
+	var req Request
+	r := bytes.NewReader(raw)
+	br := bufio.NewReader(r)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		r.Reset(raw)
+		br.Reset(r)
+		if err := req.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Dropping a name from the announced set returns its values to the header
+// section instead of leaving them in a section that is never written.
+func TestTrailerUnannounceRestoresValues(t *testing.T) {
+	t.Parallel()
+
+	var h ResponseHeader
+	if err := h.SetTrailer("X-A,X-B"); err != nil {
+		t.Fatal(err)
+	}
+	h.Set("X-A", "a")
+	h.Set("X-B", "b")
+	if err := h.SetTrailer("X-B"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.Header()); !strings.Contains(got, "X-A: a\r\n") || strings.Contains(got, "X-B: b") {
+		t.Fatalf("header section after announcing X-B only = %q", got)
+	}
+	if got := string(h.TrailerHeader()); got != "X-B: b\r\n\r\n" {
+		t.Fatalf("trailer section = %q, want only X-B", got)
+	}
+	h.Del(HeaderTrailer)
+	if got := string(h.Header()); !strings.Contains(got, "X-B: b\r\n") || len(h.TrailerHeader()) != 2 {
+		t.Fatalf("after Del(Trailer): header %q, trailer %q", got, h.TrailerHeader())
+	}
+}
+
+// Replacing the announcement through the generic setters, whose value shares
+// the header's scratch buffer, must see the new list.
+func TestSetTrailerThroughGenericSetters(t *testing.T) {
+	t.Parallel()
+
+	for name, h := range map[string]interface {
+		Set(key, value string)
+		SetBytesKV(key, value []byte)
+		Peek(key string) []byte
+		TrailerHeader() []byte
+		Header() []byte
+	}{"request": &RequestHeader{}, "response": &ResponseHeader{}} {
+		h.Set("X-Old", "old")
+		h.Set("X-New", "new")
+		h.Set(HeaderTrailer, "X-Old")
+		h.SetBytesKV([]byte(HeaderTrailer), []byte("X-New"))
+		if got := string(h.Peek(HeaderTrailer)); got != "X-New" {
+			t.Fatalf("%s: Peek(Trailer) = %q, want X-New", name, got)
+		}
+		if got := string(h.TrailerHeader()); got != "X-New: new\r\n\r\n" {
+			t.Fatalf("%s: trailer section = %q", name, got)
+		}
+		if hdr := string(h.Header()); !strings.Contains(hdr, "X-Old: old\r\n") || strings.Contains(hdr, "X-New: new") {
+			t.Fatalf("%s: header section = %q", name, hdr)
+		}
+	}
+}
+
+// Replacing the announced set only moves what changes: kept names stay in
+// place, dropped names return to the header section, added names take their
+// values along.
+func TestSetTrailerMovesOnlyTheDifference(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 200 OK\r\nX-A: upfront\r\nX-M: upfront\r\nX-N: n\r\nTrailer: X-A, X-M\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n0\r\nX-A: late\r\nX-M: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &resp.Header
+	if err := h.SetTrailer("X-A, X-M"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.TrailerHeader()); got != "X-A: late\r\nX-M: late\r\n\r\n" {
+		t.Fatalf("same set: trailer section = %q", got)
+	}
+	if hdr := string(h.Header()); !strings.Contains(hdr, "X-A: upfront\r\n") || !strings.Contains(hdr, "X-M: upfront\r\n") {
+		t.Fatalf("same set: header section = %q", hdr)
+	}
+	if err := h.SetTrailer("X-M, X-N"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.TrailerHeader()); got != "X-M: late\r\nX-N: n\r\n\r\n" {
+		t.Fatalf("X-A dropped, X-N added: trailer section = %q", got)
+	}
+	hdr := string(h.Header())
+	for _, want := range []string{"X-A: upfront\r\n", "X-A: late\r\n", "X-M: upfront\r\n"} {
+		if !strings.Contains(hdr, want) {
+			t.Fatalf("X-A dropped, X-N added: header section %q lacks %q", hdr, want)
+		}
+	}
+	if strings.Contains(hdr, "X-N: n") {
+		t.Fatalf("X-A dropped, X-N added: header section still carries X-N: %q", hdr)
+	}
+	if got := h.PeekAll("X-M"); len(got) != 2 || string(got[0]) != "upfront" || string(got[1]) != "late" {
+		t.Fatalf("PeekAll(X-M) = %q, want both sections, upfront first", got)
+	}
+}
+
+// Peek prefers an upfront value even when it is empty.
+func TestTrailerPeekPrefersEmptyUpfrontValue(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	err := req.Read(bufio.NewReader(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nX-E:\r\nTrailer: X-E\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-E: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Peek("X-E"); len(got) != 0 {
+		t.Fatalf("Peek(X-E) = %q, want the empty upfront value", got)
+	}
+	if got := req.Header.PeekAll("X-E"); len(got) != 2 || string(got[1]) != "late" {
+		t.Fatalf("PeekAll(X-E) = %q, want both sections", got)
+	}
+}
+
+// A getter that reads the header section directly still sees an announced
+// value.
+func TestTrailerAnnouncedGettersFallBack(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	if err := h.SetTrailer(HeaderReferer); err != nil {
+		t.Fatal(err)
+	}
+	h.SetReferer("https://a/")
+	if string(h.Referer()) != "https://a/" || string(h.TrailerHeader()) != "Referer: https://a/\r\n\r\n" {
+		t.Fatalf("Referer() = %q, trailer section %q", h.Referer(), h.TrailerHeader())
+	}
+}
+
+// Announcing a name after the header block has been written leaves its
+// values where they are: they were sent as headers, so only values set from
+// then on become trailers.
+// announcingReader announces a trailer as its body ends, the way a stream
+// that learns its trailers late does.
+type announcingReader struct {
+	h    *ResponseHeader
+	done bool
+}
+
+func (r *announcingReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	if err := r.h.AddTrailer("X-Sum"); err != nil {
+		return 0, err
+	}
+	r.h.Set("X-Sum", "2")
+	return copy(p, "body"), nil
+}
+
+func TestAnnounceWhileStreamingKeepsSentValues(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	resp.Header.Set("X-Sum", "1")
+	resp.SetBodyStream(&announcingReader{h: &resp.Header}, -1)
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if err := resp.Write(bw); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	head, tail, _ := strings.Cut(buf.String(), "\r\n\r\n")
+	if !strings.Contains(head, "\r\nX-Sum: 1\r\n") || strings.Contains(head, "X-Sum: 2") {
+		t.Fatalf("header block = %q, want the value sent before the announcement", head)
+	}
+	if !strings.HasSuffix(tail, "0\r\nX-Sum: 2\r\n\r\n") {
+		t.Fatalf("body and trailer = %q, want only the later value as a trailer", tail)
+	}
+	// The write is over; a new announcement moves values again.
+	if err := resp.Header.AddTrailer("X-Sum2"); err != nil {
+		t.Fatal(err)
+	}
+	resp.Header.Set("X-Sum", "3")
+	if got := string(resp.Header.TrailerHeader()); got != "X-Sum: 3\r\n\r\n" {
+		t.Fatalf("trailer section after the write = %q", got)
+	}
+
+	// Serializing for a look, as String does, sends nothing.
+	var req Request
+	req.SetRequestURI("http://a/")
+	req.Header.SetMethod(MethodPost)
+	req.Header.Set("X-Sum", "1")
+	_ = req.String()
+	if err := req.Header.SetTrailer("X-Sum"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(req.Header.TrailerHeader()); got != "X-Sum: 1\r\n\r\n" || bytes.Contains(req.Header.Header(), []byte("X-Sum: 1")) {
+		t.Fatalf("after String(): trailer section = %q, header %q", got, req.Header.Header())
+	}
+}
+
+// A special header announced as a trailer lives in the trailer section
+// whichever setter wrote it, reads back through its accessors, and returns
+// to its own storage once the announcement is dropped.
+func TestTrailerSpecialHeader(t *testing.T) {
+	t.Parallel()
+
+	for name, set := range map[string]func(h *ResponseHeader){
+		"SetServer after":  func(h *ResponseHeader) { _ = h.SetTrailer(HeaderServer); h.SetServer("edge") },
+		"SetServer before": func(h *ResponseHeader) { h.SetServer("edge"); _ = h.SetTrailer(HeaderServer) },
+		"Set after":        func(h *ResponseHeader) { _ = h.SetTrailer(HeaderServer); h.Set(HeaderServer, "edge") },
+	} {
+		var h ResponseHeader
+		set(&h)
+		if got := string(h.TrailerHeader()); got != "Server: edge\r\n\r\n" {
+			t.Fatalf("%s: trailer section = %q", name, got)
+		}
+		if string(h.Server()) != "edge" || string(h.Peek(HeaderServer)) != "edge" || len(h.PeekAll(HeaderServer)) != 1 {
+			t.Fatalf("%s: Server() = %q, Peek = %q, PeekAll = %q", name, h.Server(), h.Peek(HeaderServer), h.PeekAll(HeaderServer))
+		}
+		if bytes.Contains(h.Header(), []byte("Server:")) {
+			t.Fatalf("%s: header section still carries Server: %q", name, h.Header())
+		}
+		h.Del(HeaderTrailer)
+		if string(h.Server()) != "edge" || !bytes.Contains(h.Header(), []byte("Server: edge\r\n")) {
+			t.Fatalf("%s: un-announcing did not restore Server to the header section: %q", name, h.Header())
+		}
+	}
+
+	var rh RequestHeader
+	rh.SetUserAgent("ua")
+	if err := rh.SetTrailer(HeaderUserAgent); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(rh.TrailerHeader()); got != "User-Agent: ua\r\n\r\n" || string(rh.UserAgent()) != "ua" {
+		t.Fatalf("request: trailer section %q, UserAgent() %q", got, rh.UserAgent())
+	}
+}
+
+// A special header received only in the trailer section stays there: the
+// accessor falls back to it, but the header block and All do not.
+func TestTrailerSpecialHeaderReceivedOnlyAsTrailer(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	err := req.Read(bufio.NewReader(strings.NewReader(
+		"GET / HTTP/1.1\r\nHost: a\r\nTrailer: User-Agent\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nUser-Agent: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &req.Header
+	if string(h.UserAgent()) != "late" || string(h.Peek(HeaderUserAgent)) != "late" {
+		t.Fatalf("UserAgent() = %q, Peek = %q, want the trailer value", h.UserAgent(), h.Peek(HeaderUserAgent))
+	}
+	if bytes.Contains(h.Header(), []byte("User-Agent:")) {
+		t.Fatalf("header block carries the trailer value: %q", h.Header())
+	}
+	for k := range h.All() {
+		if string(k) == HeaderUserAgent {
+			t.Fatal("All() yielded the trailer-section User-Agent")
+		}
+	}
+	if got := string(h.TrailerHeader()); got != "User-Agent: late\r\n\r\n" {
+		t.Fatalf("trailer section = %q", got)
+	}
+}
+
+// Announcing an unrelated name must not move a special header that is already
+// announced and present in both sections of a parsed message.
+func TestAddTrailerKeepsParsedSpecialSections(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 200 OK\r\nServer: upfront\r\nTrailer: Server\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nServer: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Header.AddTrailer("X-New"); err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Header.Server()) != "upfront" || !bytes.Contains(resp.Header.Header(), []byte("Server: upfront\r\n")) {
+		t.Fatalf("response: Server() = %q, header %q", resp.Header.Server(), resp.Header.Header())
+	}
+	if got := string(resp.Header.TrailerHeader()); got != "Server: late\r\n\r\n" {
+		t.Fatalf("response trailer section = %q", got)
+	}
+
+	var req Request
+	err = req.Read(bufio.NewReader(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nUser-Agent: upfront\r\nTrailer: User-Agent\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nUser-Agent: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Header.AddTrailer("X-New"); err != nil {
+		t.Fatal(err)
+	}
+	if string(req.Header.UserAgent()) != "upfront" || !bytes.Contains(req.Header.Header(), []byte("User-Agent: upfront\r\n")) {
+		t.Fatalf("request: UserAgent() = %q, header %q", req.Header.UserAgent(), req.Header.Header())
+	}
+	if got := string(req.Header.TrailerHeader()); got != "User-Agent: late\r\n\r\n" {
+		t.Fatalf("request trailer section = %q", got)
+	}
+}
+
+// Dropping the announcement of a special header received several times in
+// the trailer section keeps every value: the first returns to its storage,
+// the rest become ordinary headers.
+func TestUnannounceKeepsRepeatedSpecialTrailers(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 200 OK\r\nTrailer: Server\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nServer: late1\r\nServer: late2\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Header.Del(HeaderTrailer)
+	hdr := string(resp.Header.Header())
+	if string(resp.Header.Server()) != "late1" || !strings.Contains(hdr, "Server: late1\r\n") || !strings.Contains(hdr, "Server: late2\r\n") {
+		t.Fatalf("response: Server() = %q, header %q", resp.Header.Server(), hdr)
+	}
+	if got := resp.Header.PeekAll(HeaderServer); len(got) != 2 || string(got[0]) != "late1" || string(got[1]) != "late2" {
+		t.Fatalf("response: PeekAll(Server) = %q, want both", got)
+	}
+	if got := resp.Header.TrailerHeader(); len(got) != 2 {
+		t.Fatalf("response trailer section = %q, want empty", got)
+	}
+	// Announcing again moves both back, in their original order.
+	if err := resp.Header.AddTrailer(HeaderServer); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(resp.Header.TrailerHeader()); got != "Server: late1\r\nServer: late2\r\n\r\n" || string(resp.Header.Server()) != "late1" {
+		t.Fatalf("re-announced: trailer section = %q, Server() = %q", got, resp.Header.Server())
+	}
+
+	var req Request
+	err = req.Read(bufio.NewReader(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nTrailer: User-Agent\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nUser-Agent: ua1\r\nUser-Agent: ua2\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Header.SetTrailer("X-Other"); err != nil {
+		t.Fatal(err)
+	}
+	hdr = string(req.Header.Header())
+	if string(req.Header.UserAgent()) != "ua1" || !strings.Contains(hdr, "User-Agent: ua1\r\n") || !strings.Contains(hdr, "User-Agent: ua2\r\n") {
+		t.Fatalf("request: UserAgent() = %q, header %q", req.Header.UserAgent(), hdr)
+	}
+	if got := req.Header.PeekAll(HeaderUserAgent); len(got) != 2 || string(got[0]) != "ua1" || string(got[1]) != "ua2" {
+		t.Fatalf("request: PeekAll(User-Agent) = %q, want both", got)
+	}
+}
+
+// Replacing the announced set treats a header with its own storage like any
+// other name: kept in place, or moved back when dropped.
+func TestSetTrailerMovesOnlyTheDifferenceForSpecialHeaders(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 200 OK\r\nServer: upfront\r\nX-M: upfront\r\nTrailer: Server, X-M\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n0\r\nServer: late\r\nX-M: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &resp.Header
+	if err := h.SetTrailer("Server, X-M"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.TrailerHeader()); got != "Server: late\r\nX-M: late\r\n\r\n" || string(h.Server()) != "upfront" {
+		t.Fatalf("same set: trailer section = %q, Server() = %q", got, h.Server())
+	}
+	if err := h.SetTrailer("X-M"); err != nil {
+		t.Fatal(err)
+	}
+	hdr := string(h.Header())
+	if string(h.Server()) != "upfront" || !strings.Contains(hdr, "Server: upfront\r\n") || !strings.Contains(hdr, "Server: late\r\n") {
+		t.Fatalf("Server dropped: Server() = %q, header section %q", h.Server(), hdr)
+	}
+	if got := string(h.TrailerHeader()); got != "X-M: late\r\n\r\n" {
+		t.Fatalf("Server dropped: trailer section = %q", got)
+	}
+}
+
+// PeekAll of a header with its own storage sees both sections too.
+func TestTrailerSpecialHeaderPeekAllBothSections(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	err := req.Read(bufio.NewReader(strings.NewReader(
+		"POST / HTTP/1.1\r\nHost: a\r\nUser-Agent: upfront\r\nTrailer: User-Agent\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n0\r\nUser-Agent: late\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.PeekAll(HeaderUserAgent); len(got) != 2 || string(got[0]) != "upfront" || string(got[1]) != "late" {
+		t.Fatalf("PeekAll(User-Agent) = %q, want [upfront late]", got)
+	}
+	if string(req.Header.UserAgent()) != "upfront" {
+		t.Fatalf("UserAgent() = %q, want the upfront value", req.Header.UserAgent())
+	}
+}
+
+// In raw-header mode an announced User-Agent is still found by every getter.
+func TestTrailerSpecialHeaderRawModeGetters(t *testing.T) {
+	t.Parallel()
+
+	var raw RequestHeader
+	raw.DisableSpecialHeader()
+	if err := raw.SetTrailer(HeaderUserAgent); err != nil {
+		t.Fatal(err)
+	}
+	raw.Set(HeaderUserAgent, "ua")
+	if string(raw.UserAgent()) != "ua" || string(raw.Peek(HeaderUserAgent)) != "ua" || len(raw.PeekAll(HeaderUserAgent)) != 1 {
+		t.Fatalf("UserAgent() = %q, Peek = %q, PeekAll = %q", raw.UserAgent(), raw.Peek(HeaderUserAgent), raw.PeekAll(HeaderUserAgent))
+	}
+	// The dedicated setter stays off the wire in this mode, as before.
+	raw.SetUserAgent("hidden")
+	if got := string(raw.TrailerHeader()); got != "User-Agent: ua\r\n\r\n" {
+		t.Fatalf("trailer section = %q", got)
+	}
+	// Dropping the announcement keeps the value in the header store, which
+	// is where raw-header mode reads and writes User-Agent.
+	raw.Del(HeaderTrailer)
+	if string(raw.UserAgent()) != "ua" || !bytes.Contains(raw.Header(), []byte("User-Agent: ua\r\n")) {
+		t.Fatalf("after Del(Trailer): UserAgent() = %q, header %q", raw.UserAgent(), raw.Header())
+	}
+}
+
+// Announcing Server after the default line was handed out moves that value
+// to the trailer section for good: the default must not resurface upfront.
+func TestTrailerServerDefaultStaysUpfront(t *testing.T) {
+	t.Parallel()
+
+	// The default line is no value of the handler's: announcing Server leaves
+	// it in the header section, read before the handler's trailer values,
+	// whether or not a getter handed it out first.
+	for _, read := range []bool{false, true} {
+		var h ResponseHeader
+		h.setServerDefault([]byte("Server: fasthttp\r\n"))
+		if read {
+			_ = h.Server()
+		}
+		if err := h.SetTrailer(HeaderServer); err != nil {
+			t.Fatal(err)
+		}
+		h.Add(HeaderServer, "late")
+		if got := string(h.TrailerHeader()); got != "Server: late\r\n\r\n" {
+			t.Fatalf("read=%v: trailer section = %q", read, got)
+		}
+		if !bytes.Contains(h.Header(), []byte("Server: fasthttp\r\n")) || string(h.Server()) != "fasthttp" {
+			t.Fatalf("read=%v: header section = %q, Server() = %q", read, h.Header(), h.Server())
+		}
+		if got := h.PeekAll(HeaderServer); len(got) != 2 || string(got[0]) != "fasthttp" || string(got[1]) != "late" {
+			t.Fatalf("read=%v: PeekAll(Server) = %q", read, got)
+		}
+	}
+
+	// A trailer received under the default line ranks after it, as after any
+	// upfront value, and dropping the announcement keeps both.
+	var recv ResponseHeader
+	recv.setServerDefault([]byte("Server: fasthttp\r\n"))
+	if err := recv.ReadTrailer(bufio.NewReader(strings.NewReader("Server: late\r\n\r\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := recv.PeekAll(HeaderServer); string(recv.Server()) != "fasthttp" || len(got) != 2 || string(got[1]) != "late" {
+		t.Fatalf("Server() = %q, PeekAll = %q", recv.Server(), got)
+	}
+	recv.Del(HeaderTrailer)
+	if hdr := string(recv.Header()); !strings.Contains(hdr, "Server: fasthttp\r\n") || !strings.Contains(hdr, "Server: late\r\n") {
+		t.Fatalf("header section = %q, want the default and the former trailer", hdr)
+	}
+}
+
+// All() respects raw-header mode for User-Agent as the getters do.
+func TestRequestHeaderAllSkipsUserAgentInRawMode(t *testing.T) {
+	t.Parallel()
+
+	var h RequestHeader
+	h.SetUserAgent("hidden")
+	h.DisableSpecialHeader()
+	for k := range h.All() {
+		if string(k) == HeaderUserAgent {
+			t.Fatal("All() yielded the User-Agent field that raw-header mode hides")
+		}
+	}
+}
+
+// An empty special-header trailer value survives un-announcing as an ordinary
+// header line, since the dedicated storage reads an empty value as absent.
+func TestUnannounceKeepsEmptySpecialTrailer(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 200 OK\r\nTrailer: Server\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nServer: \r\nServer: second\r\n\r\n"))) //nolint:dupword // two Server trailer lines on purpose
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Header.Del(HeaderTrailer)
+	hdr := string(resp.Header.Header())
+	if !strings.Contains(hdr, "Server: \r\n") || !strings.Contains(hdr, "Server: second\r\n") {
+		t.Fatalf("header section = %q, want both Server lines", hdr)
+	}
+}
+
+func TestTrailerSpecialHeaderEmptyUpfrontValue(t *testing.T) {
+	t.Parallel()
+
+	for _, upfront := range []string{"", "Server: \r\n"} {
+		var resp Response
+		err := resp.Read(bufio.NewReader(strings.NewReader(
+			"HTTP/1.1 200 OK\r\n" + upfront + "Trailer: Server\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nServer: late\r\n\r\n")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// An empty upfront value still counts for the getters, so only an
+		// absent one falls back; PeekAll leaves it out, as without trailers.
+		want := "late"
+		if upfront != "" {
+			want = ""
+		}
+		if got := string(resp.Header.Server()); got != want || string(resp.Header.Peek(HeaderServer)) != want {
+			t.Fatalf("upfront %q: Server() = %q, Peek = %q, want %q", upfront, got, resp.Header.Peek(HeaderServer), want)
+		}
+		if got := resp.Header.PeekAll(HeaderServer); len(got) != 1 || string(got[0]) != "late" {
+			t.Fatalf("upfront %q: PeekAll = %q, want [late]", upfront, got)
+		}
+	}
+
+	for _, upfront := range []string{"", "User-Agent: \r\n"} {
+		var req Request
+		err := req.Read(bufio.NewReader(strings.NewReader(
+			"POST / HTTP/1.1\r\nHost: a\r\n" + upfront + "Trailer: User-Agent\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nUser-Agent: late\r\n\r\n")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "late"
+		if upfront != "" {
+			want = ""
+		}
+		if got := string(req.Header.UserAgent()); got != want || string(req.Header.Peek(HeaderUserAgent)) != want {
+			t.Fatalf("upfront %q: UserAgent() = %q, Peek = %q, want %q", upfront, got, req.Header.Peek(HeaderUserAgent), want)
+		}
+		if got := req.Header.PeekAll(HeaderUserAgent); len(got) != 1 || string(got[0]) != "late" {
+			t.Fatalf("upfront %q: PeekAll = %q, want [late]", upfront, got)
+		}
+	}
+
+	var resp Response
+	if err := resp.Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200 OK\r\nServer: \r\nContent-Length: 0\r\n\r\n"))); err != nil {
+		t.Fatal(err)
+	}
+	var req Request
+	if err := req.Read(bufio.NewReader(strings.NewReader("GET / HTTP/1.1\r\nHost: a\r\nUser-Agent: \r\n\r\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if got, got2 := len(resp.Header.PeekAll(HeaderServer)), len(req.Header.PeekAll(HeaderUserAgent)); got != 0 || got2 != 0 {
+		t.Fatalf("without trailers: PeekAll(Server) has %d values, PeekAll(User-Agent) %d, want none", got, got2)
+	}
+}
+
+func TestAnnouncedSpecialHeaderKeepsEveryValue(t *testing.T) {
+	t.Parallel()
+
+	var resp ResponseHeader
+	if err := resp.SetTrailer("Server, Date"); err != nil {
+		t.Fatal(err)
+	}
+	resp.Add(HeaderServer, "one")
+	resp.Add(HeaderServer, "two")
+	resp.Add(HeaderDate, "Mon, 28 Sep 2026 00:00:00 GMT")
+	if got := string(resp.TrailerHeader()); got != "Server: one\r\nServer: two\r\nDate: Mon, 28 Sep 2026 00:00:00 GMT\r\n\r\n" {
+		t.Fatalf("response trailer section = %q", got)
+	}
+	if got := string(resp.Server()); got != "one" {
+		t.Fatalf("Server() = %q, want the first value", got)
+	}
+	resp.Set(HeaderServer, "three")
+	if got := resp.PeekAll(HeaderServer); len(got) != 2 || string(got[0]) != "three" || string(got[1]) != "two" {
+		t.Fatalf("after Set: PeekAll(Server) = %q, want the first value replaced", got)
+	}
+
+	var req RequestHeader
+	if err := req.SetTrailer(HeaderUserAgent); err != nil {
+		t.Fatal(err)
+	}
+	req.Add(HeaderUserAgent, "one")
+	req.Add(HeaderUserAgent, "two")
+	if got := string(req.TrailerHeader()); got != "User-Agent: one\r\nUser-Agent: two\r\n\r\n" {
+		t.Fatalf("request trailer section = %q", got)
+	}
+}
+
+// finishingReader runs finish as its body ends, the way a stream that learns
+// its trailer values late does.
+type finishingReader struct {
+	finish func()
+	done   bool
+}
+
+func (r *finishingReader) Read(p []byte) (int, error) {
+	if r.done {
+		if r.finish != nil {
+			r.finish()
+			r.finish = nil
+		}
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, "body"), nil
+}
+
+func TestTrailerSpecialHeaderSetWhileStreaming(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	if err := resp.Header.SetTrailer(HeaderServer); err != nil {
+		t.Fatal(err)
+	}
+	resp.SetBodyStream(&finishingReader{finish: func() { resp.Header.SetServer("late") }}, -1)
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if err := resp.Write(bw); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(buf.String(), "0\r\nServer: late\r\n\r\n") {
+		t.Fatalf("response = %q, want the Server set while streaming as the trailer", buf.String())
+	}
+
+	var req Request
+	req.SetRequestURI("http://a/")
+	req.Header.SetMethod(MethodPost)
+	if err := req.Header.SetTrailer(HeaderUserAgent); err != nil {
+		t.Fatal(err)
+	}
+	req.SetBodyStream(&finishingReader{finish: func() { req.Header.SetUserAgent("late") }}, -1)
+	buf.Reset()
+	bw.Reset(&buf)
+	if err := req.Write(bw); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(buf.String(), "0\r\nUser-Agent: late\r\n\r\n") {
+		t.Fatalf("request = %q, want the User-Agent set while streaming as the trailer", buf.String())
+	}
+}
+
+func TestResponseHeaderTransferEncodingOnWire(t *testing.T) {
+	t.Parallel()
+
+	// 100 and 103 exercise informational responses; 101 verifies that the
+	// protocol-switching response is still subject to the 1xx prohibition.
+	// 204 is the reported regression: forwarding a parsed No Content response
+	// must not re-emit the peer's invalid chunked framing header.
+	// 304 is a bodyless control where transfer-coding metadata is allowed,
+	// and 200 ensures ordinary chunked responses keep their framing header.
+	for _, status := range []int{StatusContinue, StatusSwitchingProtocols, StatusEarlyHints, StatusNoContent, StatusNotModified, StatusOK} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			t.Parallel()
+			var h ResponseHeader
+			// Read the header directly: informational responses have no body and
+			// Response.Read would continue looking for the final response.
+			raw := fmt.Sprintf("HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\n\r\n", status, StatusMessage(status))
+			if err := h.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+				t.Fatalf("read header: %v", err)
+			}
+			// The fix belongs to serialization, not parsing: callers must still
+			// be able to observe the original header, even for an invalid peer.
+			if got := string(h.Peek(HeaderTransferEncoding)); got != "chunked" {
+				t.Fatalf("parsed Transfer-Encoding = %q, want chunked", got)
+			}
+			wire := string(h.AppendBytes(nil))
+			// Assert both halves of the boundary: omit forbidden framing, but
+			// do not strip valid 304 metadata or change an ordinary 200 response.
+			want := status >= 200 && status != StatusNoContent
+			if got := strings.Contains(wire, "Transfer-Encoding: chunked\r\n"); got != want {
+				t.Fatalf("Transfer-Encoding on wire = %t, want %t:\n%s", got, want, wire)
+			}
+		})
 	}
 }

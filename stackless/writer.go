@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/valyala/bytebufferpool"
 )
@@ -25,7 +26,9 @@ type NewWriterFunc func(w io.Writer) Writer
 // NewWriter creates a stackless writer around a writer returned
 // from newWriter.
 //
-// The returned writer writes data to dstW.
+// The returned writer writes data to dstW. Under high load, Write and Flush
+// may return an error without running the operation. Close and Reset run on
+// the calling goroutine if the worker queue is full.
 //
 // Writers that use a lot of stack space may be wrapped into stackless writer,
 // thus saving stack space for high number of concurrently running goroutines.
@@ -40,12 +43,13 @@ func NewWriter(dstW io.Writer, newWriter NewWriterFunc) Writer {
 type writer struct {
 	dstW io.Writer
 	zw   Writer
-	xw   xWriter
 
 	err error
-	n   int
+	xw  xWriter
 
-	p  []byte
+	p []byte
+	n int
+
 	op op
 }
 
@@ -60,6 +64,13 @@ const (
 
 func (w *writer) Write(p []byte) (int, error) {
 	w.p = p
+	err := w.do(opWrite)
+	w.p = nil
+	return w.n, err
+}
+
+func (w *writer) WriteString(s string) (int, error) {
+	w.p = s2b(s)
 	err := w.do(opWrite)
 	w.p = nil
 	return w.n, err
@@ -82,14 +93,26 @@ func (w *writer) Reset(dstW io.Writer) {
 func (w *writer) do(op op) error {
 	w.op = op
 	if !stacklessWriterFunc(w) {
-		return errHighLoad
+		switch op {
+		case opWrite, opFlush:
+			w.n = 0
+			return errHighLoad
+		case opClose, opReset:
+			// Finish or discard the old stream before the writer is reused.
+			writerFunc(w)
+		}
 	}
 	err := w.err
 	if err != nil {
 		return err
 	}
 	if w.xw.bb != nil && len(w.xw.bb.B) > 0 {
-		_, err = w.dstW.Write(w.xw.bb.B)
+		b := w.xw.bb.B
+		n, errw := w.dstW.Write(b)
+		err = errw
+		if err == nil && n != len(b) {
+			err = io.ErrShortWrite
+		}
 	}
 	w.xw.Reset()
 
@@ -98,10 +121,20 @@ func (w *writer) do(op op) error {
 
 var errHighLoad = errors.New("cannot compress data due to high load")
 
-var stacklessWriterFunc = NewFunc(writerFunc)
+var (
+	stacklessWriterFuncOnce sync.Once
+	stacklessWriterFuncFunc func(ctx any) bool
+)
 
-func writerFunc(ctx interface{}) {
-	w := ctx.(*writer)
+func stacklessWriterFunc(ctx any) bool {
+	stacklessWriterFuncOnce.Do(func() {
+		stacklessWriterFuncFunc = NewFunc(writerFunc)
+	})
+	return stacklessWriterFuncFunc(ctx)
+}
+
+func writerFunc(ctx any) {
+	w := ctx.(*writer) //nolint:forcetypeassert
 	switch w.op {
 	case opWrite:
 		w.n, w.err = w.zw.Write(w.p)

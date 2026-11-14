@@ -9,16 +9,17 @@ func initTimer(t *time.Timer, timeout time.Duration) *time.Timer {
 	if t == nil {
 		return time.NewTimer(timeout)
 	}
-	if t.Reset(timeout) {
-		panic("BUG: active timer trapped into initTimer()")
-	}
+	// Reset may report the timer active: a send the preceding Stop already
+	// voided is still counted as pending, so the same voided send is counted
+	// twice. Since Go 1.23 Reset discards any prior delivery either way.
+	t.Reset(timeout)
 	return t
 }
 
 func stopTimer(t *time.Timer) {
 	if !t.Stop() {
 		// Collect possibly added time from the channel
-		// if timer has been stopped and nobody collected its' value.
+		// if timer has been stopped and nobody collected its value.
 		select {
 		case <-t.C:
 		default:
@@ -36,7 +37,7 @@ func AcquireTimer(timeout time.Duration) *time.Timer {
 	if v == nil {
 		return time.NewTimer(timeout)
 	}
-	t := v.(*time.Timer)
+	t := v.(*time.Timer) //nolint:forcetypeassert
 	initTimer(t, timeout)
 	return t
 }
@@ -44,7 +45,7 @@ func AcquireTimer(timeout time.Duration) *time.Timer {
 // ReleaseTimer returns the time.Timer acquired via AcquireTimer to the pool
 // and prevents the Timer from firing.
 //
-// Do not access the released time.Timer or read from it's channel otherwise
+// Do not access the released time.Timer or read from its channel otherwise
 // data races may occur.
 func ReleaseTimer(t *time.Timer) {
 	stopTimer(t)

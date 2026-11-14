@@ -1,36 +1,40 @@
 package stackless
 
 import (
-	"fmt"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestNewFuncSimple(t *testing.T) {
-	var n uint64
-	f := NewFunc(func(ctx interface{}) {
-		atomic.AddUint64(&n, uint64(ctx.(int)))
+	t.Parallel()
+
+	var n atomic.Uint64
+	f := NewFunc(func(ctx any) {
+		n.Add(uint64(ctx.(int))) //nolint:forcetypeassert
 	})
 
 	iterations := 4 * 1024
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		if !f(2) {
 			t.Fatalf("f mustn't return false")
 		}
 	}
-	if n != uint64(2*iterations) {
-		t.Fatalf("Unexpected n: %d. Expecting %d", n, 2*iterations)
+	if got := n.Load(); got != uint64(2*iterations) {
+		t.Fatalf("Unexpected n: %d. Expecting %d", got, 2*iterations)
 	}
 }
 
 func TestNewFuncMulti(t *testing.T) {
-	var n1, n2 uint64
-	f1 := NewFunc(func(ctx interface{}) {
-		atomic.AddUint64(&n1, uint64(ctx.(int)))
+	t.Parallel()
+
+	var n1, n2 atomic.Uint64
+	f1 := NewFunc(func(ctx any) {
+		n1.Add(uint64(ctx.(int))) //nolint:forcetypeassert
 	})
-	f2 := NewFunc(func(ctx interface{}) {
-		atomic.AddUint64(&n2, uint64(ctx.(int)))
+	f2 := NewFunc(func(ctx any) {
+		n2.Add(uint64(ctx.(int))) //nolint:forcetypeassert
 	})
 
 	iterations := 4 * 1024
@@ -38,9 +42,9 @@ func TestNewFuncMulti(t *testing.T) {
 	f1Done := make(chan error, 1)
 	go func() {
 		var err error
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			if !f1(3) {
-				err = fmt.Errorf("f1 mustn't return false")
+				err = errors.New("f1 mustn't return false")
 				break
 			}
 		}
@@ -50,9 +54,9 @@ func TestNewFuncMulti(t *testing.T) {
 	f2Done := make(chan error, 1)
 	go func() {
 		var err error
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			if !f2(5) {
-				err = fmt.Errorf("f2 mustn't return false")
+				err = errors.New("f2 mustn't return false")
 				break
 			}
 		}
@@ -62,7 +66,7 @@ func TestNewFuncMulti(t *testing.T) {
 	select {
 	case err := <-f1Done:
 		if err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timeout")
@@ -71,16 +75,16 @@ func TestNewFuncMulti(t *testing.T) {
 	select {
 	case err := <-f2Done:
 		if err != nil {
-			t.Fatalf("unexpected error: %s", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timeout")
 	}
 
-	if n1 != uint64(3*iterations) {
-		t.Fatalf("unexpected n1: %d. Expecting %d", n1, 3*iterations)
+	if got1 := n1.Load(); got1 != uint64(3*iterations) {
+		t.Fatalf("unexpected n1: %d. Expecting %d", got1, 3*iterations)
 	}
-	if n2 != uint64(5*iterations) {
-		t.Fatalf("unexpected n2: %d. Expecting %d", n2, 5*iterations)
+	if got2 := n2.Load(); got2 != uint64(5*iterations) {
+		t.Fatalf("unexpected n2: %d. Expecting %d", got2, 5*iterations)
 	}
 }

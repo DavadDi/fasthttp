@@ -3,18 +3,22 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/valyala/bytebufferpool"
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
 func TestStreamingPipeline(t *testing.T) {
 	t.Parallel()
 
-	reqS := `POST /one HTTP/1.1
+	reqS := strings.ReplaceAll(`POST /one HTTP/1.1
 Host: example.com
 Content-Length: 10
 
@@ -23,19 +27,19 @@ POST /two HTTP/1.1
 Host: example.com
 Content-Length: 10
 
-aaaaaaaaaa`
+aaaaaaaaaa`, "\n", "\r\n")
 
 	ln := fasthttputil.NewInmemoryListener()
 
 	s := &Server{
 		StreamRequestBody: true,
 		Handler: func(ctx *RequestCtx) {
-			body := ""
+			var body string
 			expected := "aaaaaaaaaa"
 			if string(ctx.Path()) == "/one" {
 				body = string(ctx.PostBody())
 			} else {
-				all, err := ioutil.ReadAll(ctx.RequestBodyStream())
+				all, err := io.ReadAll(ctx.RequestBodyStream())
 				if err != nil {
 					t.Error(err)
 				}
@@ -50,17 +54,17 @@ aaaaaaaaaa`
 	ch := make(chan struct{})
 	go func() {
 		if err := s.Serve(ln); err != nil {
-			t.Errorf("unexpected error: %s", err)
+			t.Errorf("unexpected error: %v", err)
 		}
 		close(ch)
 	}()
 
 	conn, err := ln.Dial()
 	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, err = conn.Write([]byte(reqS)); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var resp Response
@@ -68,14 +72,14 @@ aaaaaaaaaa`
 	respCh := make(chan struct{})
 	go func() {
 		if err := resp.Read(br); err != nil {
-			t.Errorf("error when reading response: %s", err)
+			t.Errorf("error when reading response: %v", err)
 		}
 		if resp.StatusCode() != StatusOK {
 			t.Errorf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusOK)
 		}
 
 		if err := resp.Read(br); err != nil {
-			t.Errorf("error when reading response: %s", err)
+			t.Errorf("error when reading response: %v", err)
 		}
 		if resp.StatusCode() != StatusOK {
 			t.Errorf("unexpected status code %d. Expecting %d", resp.StatusCode(), StatusOK)
@@ -85,34 +89,34 @@ aaaaaaaaaa`
 
 	select {
 	case <-respCh:
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("timeout")
 	}
 
 	if err := ln.Close(); err != nil {
-		t.Fatalf("error when closing listener: %s", err)
+		t.Fatalf("error when closing listener: %v", err)
 	}
 
 	select {
 	case <-ch:
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("timeout when waiting for the server to stop")
 	}
 }
 
-func TestRequestStream(t *testing.T) {
-	body := createFixedBody(3)
-	chunkedBody := createChunkedBody(body)
+func getChunkedTestEnv(t testing.TB) (*fasthttputil.InmemoryListener, []byte) {
+	body := createFixedBody(128 * 1024)
+	chunkedBody := createChunkedBody(body, nil, true)
 
 	testHandler := func(ctx *RequestCtx) {
-		bodyBytes, err := ioutil.ReadAll(ctx.RequestBodyStream())
+		bodyBytes, err := io.ReadAll(ctx.RequestBodyStream())
 		if err != nil {
-			t.Logf("ioutil read returned err=%s", err)
+			t.Logf("io read returned err=%v", err)
 			t.Error("unexpected error while reading request body stream")
 		}
 
-		if !bytes.Equal(chunkedBody, bodyBytes) {
-			t.Errorf("unexpected request body, expected %q, got %q", chunkedBody, bodyBytes)
+		if !bytes.Equal(body, bodyBytes) {
+			t.Errorf("unexpected request body, expected %q, got %q", body, bodyBytes)
 		}
 	}
 	s := &Server{
@@ -126,90 +130,133 @@ func TestRequestStream(t *testing.T) {
 	go func() {
 		err := s.Serve(ln)
 		if err != nil {
-			t.Errorf("could not serve listener: %s", err)
+			t.Errorf("could not serve listener: %v", err)
 		}
 	}()
 
 	req := Request{}
-	req.SetHost("localhost")
+	req.Header.SetHost("localhost")
 	req.Header.SetMethod("POST")
-	req.SetBodyStream(bytes.NewBuffer(chunkedBody), len(chunkedBody))
 	req.Header.Set("transfer-encoding", "chunked")
 	req.Header.SetContentLength(-1)
 
-	formattedRequest := req.String()
+	formattedRequest := req.Header.Header()
+	formattedRequest = append(formattedRequest, chunkedBody...)
+
+	return ln, formattedRequest
+}
+
+func TestRequestStreamChunkedWithTrailer(t *testing.T) {
+	t.Parallel()
+
+	body := createFixedBody(10)
+	expectedTrailer := map[string]string{
+		"Foo": "footest",
+		"Bar": "bartest",
+	}
+	chunkedBody := createChunkedBody(body, expectedTrailer, true)
+	req := fmt.Sprintf(strings.ReplaceAll(`POST / HTTP/1.1
+Host: example.com
+Transfer-Encoding: chunked
+Trailer: Foo, Bar
+
+%s
+`, "\n", "\r\n"), chunkedBody)
+
+	ln := fasthttputil.NewInmemoryListener()
+	ch := make(chan struct{})
+	s := &Server{
+		StreamRequestBody: true,
+		Handler: func(ctx *RequestCtx) {
+			all, err := io.ReadAll(ctx.RequestBodyStream())
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(all, body) {
+				t.Errorf("unexpected body %q. Expecting %q", all, body)
+			}
+
+			for k, v := range expectedTrailer {
+				r := ctx.Request.Header.Peek(k)
+				if string(r) != v {
+					t.Errorf("unexpected trailer %q. Expecting %q. Got %q", k, v, r)
+				}
+			}
+			close(ch)
+		},
+	}
+
+	ch2 := make(chan struct{})
+	go func() {
+		if err := s.Serve(ln); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		close(ch2)
+	}()
+
+	conn, err := ln.Dial()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err = conn.Write([]byte(req)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("error when closing listener: %v", err)
+	}
+
+	select {
+	case <-ch:
+		select {
+		case <-ch2:
+		case <-time.After(testTimeout(time.Second)):
+			t.Fatal("timeout when waiting for the server to stop")
+		}
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatal("timeout when waiting for the request to be processed")
+	}
+}
+
+func TestRequestStream(t *testing.T) {
+	t.Parallel()
+
+	ln, formattedRequest := getChunkedTestEnv(t)
+
 	c, err := ln.Dial()
 	if err != nil {
-		t.Errorf("unexpected error while dialing: %s", err)
+		t.Errorf("unexpected error while dialing: %v", err)
 	}
-	if _, err = c.Write([]byte(formattedRequest)); err != nil {
-		t.Errorf("unexpected error while writing request: %s", err)
+	if _, err = c.Write(formattedRequest); err != nil {
+		t.Errorf("unexpected error while writing request: %v", err)
 	}
 
 	br := bufio.NewReader(c)
 	var respH ResponseHeader
 	if err = respH.Read(br); err != nil {
-		t.Errorf("unexpected error: %s", err)
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
 func BenchmarkRequestStreamE2E(b *testing.B) {
-	body := createFixedBody(3)
-	chunkedBody := createChunkedBody(body)
+	ln, formattedRequest := getChunkedTestEnv(b)
 
-	testHandler := func(ctx *RequestCtx) {
-		bodyBytes, err := ioutil.ReadAll(ctx.RequestBodyStream())
-		if err != nil {
-			b.Logf("ioutil read returned err=%s", err)
-			b.Error("unexpected error while reading request body stream")
-		}
-
-		if !bytes.Equal(chunkedBody, bodyBytes) {
-			b.Errorf("unexpected request body, expected %q, got %q", chunkedBody, bodyBytes)
-		}
-	}
-	s := &Server{
-		Handler:            testHandler,
-		StreamRequestBody:  true,
-		MaxRequestBodySize: 1, // easier to test with small limit
-	}
-
-	ln := fasthttputil.NewInmemoryListener()
 	wg := &sync.WaitGroup{}
-
-	go func() {
-		err := s.Serve(ln)
-
-		if err != nil {
-			b.Errorf("could not serve listener: %s", err)
-		}
-	}()
-
-	req := Request{}
-	req.SetHost("localhost")
-	req.Header.SetMethod("POST")
-	req.SetBodyStream(bytes.NewBuffer(chunkedBody), len(chunkedBody))
-	req.Header.Set("transfer-encoding", "chunked")
-	req.Header.SetContentLength(-1)
-
-	formattedRequest := []byte(req.String())
-
 	wg.Add(4)
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		go func(wg *sync.WaitGroup) {
 			for i := 0; i < b.N/4; i++ {
 				c, err := ln.Dial()
 				if err != nil {
-					b.Errorf("unexpected error while dialing: %s", err)
+					b.Errorf("unexpected error while dialing: %v", err)
 				}
 				if _, err = c.Write(formattedRequest); err != nil {
-					b.Errorf("unexpected error while writing request: %s", err)
+					b.Errorf("unexpected error while writing request: %v", err)
 				}
 
 				br := bufio.NewReaderSize(c, 128)
 				var respH ResponseHeader
 				if err = respH.Read(br); err != nil {
-					b.Errorf("unexpected error: %s", err)
+					b.Errorf("unexpected error: %v", err)
 				}
 				c.Close()
 			}
@@ -218,4 +265,135 @@ func BenchmarkRequestStreamE2E(b *testing.B) {
 	}
 
 	wg.Wait()
+}
+
+// TestRequestStreamStaysAtEOF verifies that a chunked requestStream keeps
+// returning io.EOF once the terminating chunk has been consumed.
+//
+// Without a terminal state, a second Read re-enters parseChunkSize and waits for
+// another chunk header that is never coming. On a keep-alive connection, which
+// stays open after the response body ends, that read blocks for as long as the
+// peer holds the socket open. Any caller that reads a streamed body to EOF and
+// then reads again - draining before release is the common case - parks a
+// goroutine and never releases the connection.
+func TestRequestStreamStaysAtEOF(t *testing.T) {
+	t.Parallel()
+
+	body := createFixedBody(10)
+	chunked := createChunkedBody(body, nil, true)
+
+	// A pipe that is never closed models a keep-alive connection: the body ends,
+	// but the peer keeps the socket open and sends nothing more.
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(chunked)
+	}()
+	t.Cleanup(func() { _ = pr.Close() })
+
+	var h ResponseHeader
+	h.SetContentLength(-1)
+
+	bb := bytebufferpool.Get()
+	defer bytebufferpool.Put(bb)
+	rs := acquireRequestStream(bb, bufio.NewReader(pr), &h)
+	defer releaseRequestStream(rs)
+
+	got, err := io.ReadAll(rs)
+	if err != nil {
+		t.Fatalf("unexpected error reading body: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("unexpected body %q. Expecting %q", got, body)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, readErr := rs.Read(make([]byte, 1))
+		done <- readErr
+	}()
+
+	select {
+	case readErr := <-done:
+		if !errors.Is(readErr, io.EOF) {
+			t.Fatalf("unexpected error on read after EOF: %v. Expecting io.EOF", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read after EOF blocked waiting for another chunk header")
+	}
+}
+
+func TestRequestStreamChunkedTruncatedAtChunkBoundary(t *testing.T) {
+	t.Parallel()
+
+	// The peer sends a complete chunk, then closes before the last chunk.
+	var h ResponseHeader
+	h.SetContentLength(-1)
+
+	bb := bytebufferpool.Get()
+	defer bytebufferpool.Put(bb)
+	rs := acquireRequestStream(bb, bufio.NewReader(strings.NewReader("5\r\nhello\r\n")), &h)
+	defer releaseRequestStream(rs)
+
+	got, err := io.ReadAll(rs)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.ErrUnexpectedEOF)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("unexpected body %q. Expecting %q", got, "hello")
+	}
+}
+
+func TestBodyStreamTruncatedChunkFraming(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, body, want string
+		brokenChunk      bool
+	}{
+		{"missing first chunk", "", "", false},
+		{"missing next chunk", "3\r\nabc\r\n", "abc", false},
+		{"missing trailer terminator", "3\r\nabc\r\n0\r\n", "abc", true},
+		{"unterminated trailer", "3\r\nabc\r\n0\r\nX-Test: value", "abc", true},
+		{"missing blank line after trailer", "3\r\nabc\r\n0\r\nX-Test: value\r\n", "abc", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, response := range []bool{false, true} {
+				t.Run(fmt.Sprintf("response=%v", response), func(t *testing.T) {
+					var req Request
+					var resp Response
+					defer req.Reset()
+					defer resp.Reset()
+					var stream io.Reader
+					const header = "Transfer-Encoding: chunked\r\nTrailer: X-Test\r\n\r\n"
+					if response {
+						resp.StreamBody = true
+						if err := resp.Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200 OK\r\n" + header + tc.body))); err != nil {
+							t.Fatal(err)
+						}
+						stream = resp.BodyStream()
+					} else {
+						br := bufio.NewReader(strings.NewReader("POST / HTTP/1.1\r\nHost: example.com\r\n" + header + tc.body))
+						if err := req.Header.Read(br); err != nil {
+							t.Fatal(err)
+						}
+						if err := req.ContinueReadBodyStream(br, 1, false); err != nil {
+							t.Fatal(err)
+						}
+						stream = req.BodyStream()
+					}
+					got, err := io.ReadAll(stream)
+					if tc.brokenChunk {
+						var broken ErrBrokenChunk
+						if !errors.As(err, &broken) || !errors.Is(broken.error, io.ErrUnexpectedEOF) {
+							t.Fatalf("got %v, want ErrBrokenChunk containing io.ErrUnexpectedEOF", err)
+						}
+					} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("got %v, want io.ErrUnexpectedEOF", err)
+					}
+					if string(got) != tc.want {
+						t.Fatalf("got body %q, want %q", got, tc.want)
+					}
+				})
+			}
+		})
+	}
 }
